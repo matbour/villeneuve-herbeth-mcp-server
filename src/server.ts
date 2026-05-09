@@ -4,7 +4,12 @@ import { mkdir } from "node:fs/promises";
 import { dirname, isAbsolute, resolve } from "node:path";
 import { homedir } from "node:os";
 import { HerbethClient, classeursAsArray, type Space } from "./client.ts";
-import type { MetadataStore, DocumentMetadata } from "./metadata.ts";
+import {
+  DOC_TYPES,
+  type MetadataStore,
+  type DocumentMetadata,
+  type MetadataInput,
+} from "./metadata.ts";
 
 const DEFAULT_DOWNLOAD_DIR =
   Bun.env.HERBETH_DOWNLOAD_DIR ?? `${homedir()}/Downloads/herbeth`;
@@ -28,14 +33,24 @@ function sanitizeFilename(name: string): string {
 function metadataView(meta: DocumentMetadata) {
   return {
     document_id: meta.document_id,
+    doc_type: meta.doc_type,
     title: meta.title,
     classeur_id: meta.classeur_id,
+    target_classeur: meta.target_classeur,
+    target_filename: meta.target_filename,
     supplier: meta.supplier,
     amount_cents: meta.amount_cents,
+    amount_ht_cents: meta.amount_ht_cents,
+    vat_cents: meta.vat_cents,
     currency: meta.currency,
     document_date: meta.document_date,
+    period_start: meta.period_start,
+    period_end: meta.period_end,
+    reference: meta.reference,
+    language: meta.language,
     tags: meta.tags,
     notes: meta.notes,
+    extra: meta.extra,
     source: {
       file_name: meta.source_file_name,
       title: meta.source_title,
@@ -47,18 +62,39 @@ function metadataView(meta: DocumentMetadata) {
   };
 }
 
+function metadataSummary(meta: DocumentMetadata) {
+  return {
+    doc_type: meta.doc_type,
+    title: meta.title,
+    target_classeur: meta.target_classeur,
+    target_filename: meta.target_filename,
+    supplier: meta.supplier,
+    amount_cents: meta.amount_cents,
+    currency: meta.currency,
+    document_date: meta.document_date,
+    period_start: meta.period_start,
+    period_end: meta.period_end,
+    reference: meta.reference,
+    tags: meta.tags,
+    notes: meta.notes,
+  };
+}
+
 export function createMcpServer(
   client: HerbethClient,
   metadata: MetadataStore,
 ): McpServer {
   const server = new McpServer(
-    { name: "villeneuve-herbeth-mcp-server", version: "0.1.0" },
+    { name: "villeneuve-herbeth-mcp-server", version: "0.2.0" },
     {
       instructions:
         "Tools to interact with the Villeneuve / Herbeth Immobilier copropriété extranet (crypto-extranet.com). " +
-        "Use list_classeurs to discover folders, list_documents to enumerate files inside one, and download_file to save a document to disk. " +
+        "Use list_classeurs to discover folders, list_documents to enumerate files inside one, and download_file to save a document. " +
         "Document IDs returned by list_documents are stable and required for download_file. " +
-        "Source filenames and classeurs are often inaccurate, so use get/set_document_metadata and search_documents to layer corrected titles, suppliers, amounts, dates, tags, and notes on top.",
+        "Source filenames and classeurs are often inaccurate or wrong; use set_document_metadata to layer corrected metadata " +
+        "(doc_type, title, supplier, amount, dates, period, reference, tags, notes, target_classeur, target_filename, plus a free-form `extra` JSON bag for type-specific fields). " +
+        `Recommended doc_type values: ${DOC_TYPES.join(", ")}. ` +
+        "search_documents and metadata_stats query the curated DB. The goal is to enable building a properly-named, properly-organized parallel filesystem.",
     },
   );
 
@@ -115,7 +151,7 @@ export function createMcpServer(
   server.tool(
     "list_documents",
     "List documents inside a classeur. Provide either classeur_id (preferred) or classeur_name (case-insensitive match). " +
-      "Returns each document's id (use with download_file), file_name, title, mime_type, date_commit, and any user-curated metadata override (corrected_title, supplier, amount, tags, etc.).",
+      "Returns each document's id (use with download_file), source file_name/title/date_commit, plus any user-curated metadata (doc_type, corrected title, supplier, amount, dates, target_classeur, etc.).",
     {
       space: spaceSchema,
       classeur_id: z
@@ -169,18 +205,7 @@ export function createMcpServer(
           date_commit: d.date_commit,
           date_commit_libelle: d.date_commit_libelle,
           classeur_id: d.documents_classeurs_id,
-          metadata: meta
-            ? {
-                title: meta.title,
-                classeur_id: meta.classeur_id,
-                supplier: meta.supplier,
-                amount_cents: meta.amount_cents,
-                currency: meta.currency,
-                document_date: meta.document_date,
-                tags: meta.tags,
-                notes: meta.notes,
-              }
-            : null,
+          metadata: meta ? metadataSummary(meta) : null,
         };
       });
       const sliced = limit ? docs.slice(0, limit) : docs;
@@ -311,13 +336,9 @@ export function createMcpServer(
 
   server.tool(
     "get_document_metadata",
-    "Read user-curated metadata for a document (corrected title, supplier, amount, document_date, tags, notes, etc.). Returns null if no metadata has been recorded yet.",
+    "Read full user-curated metadata for a document. Returns null if no metadata has been recorded yet.",
     {
-      document_id: z
-        .number()
-        .int()
-        .positive()
-        .describe("Document id from list_documents."),
+      document_id: z.number().int().positive().describe("Document id from list_documents."),
     },
     async ({ document_id }) => {
       const meta = metadata.get(document_id);
@@ -338,9 +359,20 @@ export function createMcpServer(
 
   server.tool(
     "set_document_metadata",
-    "Upsert user-curated metadata for a document. Only fields provided are updated; omit a field to leave it unchanged. Pass null to clear a single field. Tags replace the previous tag list (pass [] to clear). Useful for fixing wrong titles, recording the real classeur a document belongs to, or tagging invoices with supplier/amount/date.",
+    "Upsert user-curated metadata for a document. Only fields explicitly provided are updated; omit a field to leave it unchanged. " +
+      "Pass null on a field to clear it. Tags / extra are wholesale replacements (pass [] / {} to clear). " +
+      "Use this to fix wrong titles, tag the doc_type, record real document dates, supplier, amount HT/TTC/VAT, period, " +
+      "and choose where the file lives in the parallel filesystem (target_classeur + target_filename). " +
+      "Use the `extra` JSON bag for type-specific fields (e.g. attendees for meeting_minutes, IBAN for bank_statement, contract terms, etc.).",
     {
       document_id: z.number().int().positive().describe("Document id from list_documents."),
+      doc_type: z
+        .string()
+        .nullable()
+        .optional()
+        .describe(
+          `Document type tag. Recommended values: ${DOC_TYPES.join(", ")}. Free-form, but stick to one of these for consistency.`,
+        ),
       title: z
         .string()
         .nullable()
@@ -352,31 +384,83 @@ export function createMcpServer(
         .positive()
         .nullable()
         .optional()
-        .describe("Override classeur (the one the doc *should* live in). Pass null to clear."),
+        .describe(
+          "Override the extranet classeur this doc *should* live in (numeric id). Mostly for tracking miscategorization. Pass null to clear.",
+        ),
+      target_classeur: z
+        .string()
+        .nullable()
+        .optional()
+        .describe(
+          "Logical bucket for the parallel filesystem (e.g. 'Factures/2026', 'Contrats/Syndic', 'AG/PV'). Free-form path-like string. Pass null to clear.",
+        ),
+      target_filename: z
+        .string()
+        .nullable()
+        .optional()
+        .describe(
+          "Desired filename in the parallel filesystem (e.g. '2026-04-23_FZ-Nettoyage_Facture-26-04-67644.pdf'). Pass null to clear.",
+        ),
       supplier: z
         .string()
         .nullable()
         .optional()
-        .describe("Supplier / vendor name (e.g. for invoices). Pass null to clear."),
+        .describe("Supplier / vendor / counterparty name. Pass null to clear."),
       amount_cents: z
         .number()
         .int()
         .nullable()
         .optional()
-        .describe("Amount in cents (integer to avoid floats). Pass null to clear."),
+        .describe("Amount TTC in cents. Pass null to clear."),
+      amount_ht_cents: z
+        .number()
+        .int()
+        .nullable()
+        .optional()
+        .describe("Amount HT (excl. VAT) in cents. Pass null to clear."),
+      vat_cents: z
+        .number()
+        .int()
+        .nullable()
+        .optional()
+        .describe("VAT amount in cents. Pass null to clear."),
       currency: z
         .string()
         .length(3)
         .nullable()
         .optional()
-        .describe("ISO 4217 currency code (e.g. EUR). Pass null to clear."),
+        .describe("ISO 4217 currency code. Pass null to clear."),
       document_date: z
         .string()
         .nullable()
         .optional()
         .describe(
-          "Real document date as ISO 8601 YYYY-MM-DD (the date on the document itself, not the upload date). Pass null to clear.",
+          "Real document date (date on the doc itself) as ISO YYYY-MM-DD. Pass null to clear.",
         ),
+      period_start: z
+        .string()
+        .nullable()
+        .optional()
+        .describe(
+          "Start of the period the document covers (ISO YYYY-MM-DD). Useful for invoices, bank statements, contracts, accounts. Pass null to clear.",
+        ),
+      period_end: z
+        .string()
+        .nullable()
+        .optional()
+        .describe("End of the covered period (ISO YYYY-MM-DD). Pass null to clear."),
+      reference: z
+        .string()
+        .nullable()
+        .optional()
+        .describe(
+          "External reference / number (invoice number, contract number, devis ref, etc.). Pass null to clear.",
+        ),
+      language: z
+        .string()
+        .nullable()
+        .optional()
+        .describe("ISO 639-1 language code (default 'fr'). Pass null to clear."),
       tags: z
         .array(z.string())
         .nullable()
@@ -387,40 +471,48 @@ export function createMcpServer(
         .nullable()
         .optional()
         .describe("Free-form notes. Pass null to clear."),
+      extra: z
+        .record(z.unknown())
+        .nullable()
+        .optional()
+        .describe(
+          "Free-form JSON bag for type-specific fields (attendees, parties, IBAN, contract terms, etc.). Pass {} to clear.",
+        ),
       capture_source_snapshot: z
         .boolean()
         .default(true)
         .describe(
-          "When true (default), fetches the document's current source fields (file_name, title, classeur_id, date_commit) and stores them alongside, so you can later detect drift if the extranet entry changes.",
+          "When true (default) and a source classeur is known (via source_classeur_id arg, prior snapshot, or classeur_id override), " +
+            "fetch the doc's current source fields (file_name, title, classeur_id, date_commit) and store them. Lets you detect later if the extranet entry drifted.",
+        ),
+      source_classeur_id: z
+        .number()
+        .int()
+        .positive()
+        .optional()
+        .describe(
+          "Hint: the extranet classeur where this doc currently lives. Required (or already known from a prior snapshot) for the snapshot capture to succeed. " +
+            "Just pass the same classeur_id you used in list_documents.",
         ),
       space: spaceSchema.optional(),
     },
-    async ({
-      document_id,
-      title,
-      classeur_id,
-      supplier,
-      amount_cents,
-      currency,
-      document_date,
-      tags,
-      notes,
-      capture_source_snapshot,
-      space,
-    }) => {
-      const input: Parameters<typeof metadata.upsert>[0] = { document_id };
-      if (title !== undefined) input.title = title;
-      if (classeur_id !== undefined) input.classeur_id = classeur_id;
-      if (supplier !== undefined) input.supplier = supplier;
-      if (amount_cents !== undefined) input.amount_cents = amount_cents;
-      if (currency !== undefined) input.currency = currency;
-      if (document_date !== undefined) input.document_date = document_date;
-      if (tags !== undefined) input.tags = tags;
-      if (notes !== undefined) input.notes = notes;
+    async (args) => {
+      const {
+        document_id,
+        capture_source_snapshot,
+        source_classeur_id,
+        space,
+        ...rest
+      } = args;
+
+      const input: MetadataInput = { document_id, ...rest };
 
       if (capture_source_snapshot) {
         const existing = metadata.get(document_id);
-        const snapshotClasseur = existing?.source_classeur_id ?? classeur_id ?? undefined;
+        const snapshotClasseur =
+          source_classeur_id ??
+          existing?.source_classeur_id ??
+          (input.classeur_id ?? undefined);
         if (snapshotClasseur) {
           try {
             const listing = await client.listDocumentsInClasseur(
@@ -467,12 +559,21 @@ export function createMcpServer(
 
   server.tool(
     "search_documents",
-    "Search the user-curated metadata DB. Combines filters (text on title/notes/supplier/source_file_name, supplier, tag, classeur_id override, document_date range, amount range). Only returns documents that have stored metadata — for unannotated documents, use list_documents.",
+    "Search the user-curated metadata DB. Combines filters (text, doc_type, supplier, tag, classeur_id, target_classeur, reference, document_date range, amount range). " +
+      "Only returns documents that have stored metadata — for unannotated documents, use list_documents.",
     {
       text: z
         .string()
         .optional()
-        .describe("Free-text LIKE match against title, notes, supplier, source_file_name."),
+        .describe(
+          "Free-text LIKE match against title, notes, supplier, source_file_name, reference.",
+        ),
+      doc_type: z
+        .string()
+        .optional()
+        .describe(
+          `Filter by doc_type. Recommended values: ${DOC_TYPES.join(", ")}.`,
+        ),
       supplier: z.string().optional().describe("Exact supplier match."),
       tag: z.string().optional().describe("Match a single tag from the tags list."),
       classeur_id: z
@@ -481,24 +582,29 @@ export function createMcpServer(
         .positive()
         .optional()
         .describe("Filter by override classeur_id."),
+      target_classeur: z
+        .string()
+        .optional()
+        .describe("Filter by target_classeur (parallel filesystem bucket)."),
+      reference: z.string().optional().describe("Exact reference / invoice number."),
       document_date_from: z
         .string()
         .optional()
-        .describe("ISO date YYYY-MM-DD inclusive lower bound on document_date."),
+        .describe("ISO YYYY-MM-DD inclusive lower bound on document_date."),
       document_date_to: z
         .string()
         .optional()
-        .describe("ISO date YYYY-MM-DD inclusive upper bound on document_date."),
+        .describe("ISO YYYY-MM-DD inclusive upper bound on document_date."),
       amount_min_cents: z
         .number()
         .int()
         .optional()
-        .describe("Inclusive minimum amount in cents."),
+        .describe("Inclusive minimum amount_cents (TTC)."),
       amount_max_cents: z
         .number()
         .int()
         .optional()
-        .describe("Inclusive maximum amount in cents."),
+        .describe("Inclusive maximum amount_cents (TTC)."),
       limit: z
         .number()
         .int()
@@ -514,15 +620,23 @@ export function createMcpServer(
           {
             type: "text",
             text: JSON.stringify(
-              {
-                count: results.length,
-                results: results.map(metadataView),
-              },
+              { count: results.length, results: results.map(metadataView) },
               null,
               2,
             ),
           },
         ],
+      };
+    },
+  );
+
+  server.tool(
+    "metadata_stats",
+    "Aggregate counts across the curated metadata DB: total annotated docs, breakdown by doc_type, top suppliers, breakdown by target_classeur. Useful to gauge progress building the parallel filesystem.",
+    {},
+    async () => {
+      return {
+        content: [{ type: "text", text: JSON.stringify(metadata.stats(), null, 2) }],
       };
     },
   );
