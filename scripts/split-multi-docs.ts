@@ -109,18 +109,35 @@ function detectInvoiceChildren(pages: string[]): DetectedChild[] {
   return children;
 }
 
+/** Extract the (relevé number, date) signature from a bank statement page header. */
+function bankSignature(page: string): string | null {
+  const head = page.slice(0, 800);
+  const m =
+    head.match(/relev[ée]\s*de\s*compte\s*n[°ºo]\s*(\d+)\s*au\s*(\d{1,2}[\/.\-]\d{1,2}[\/.\-]\d{2,4})/i) ??
+    head.match(/RELEVE\s+N[°ºo]\s+(\d+)\s+AU\s+(\d{1,2}[\/.\-]\d{1,2}[\/.\-]\d{2,4})/);
+  return m ? `${m[1]}|${m[2]}` : null;
+}
+
 function detectBankChildren(pages: string[]): DetectedChild[] {
-  const starts: number[] = [];
+  // Each page has a (releve number, date) signature when it's the start of
+  // a statement. Pages where the signature differs from the previous
+  // recorded signature open a new child group; pages without a signature
+  // (or with the same signature) extend the current group.
+  const starts: Array<{ page: number; sig: string }> = [];
+  let lastSig: string | null = null;
   pages.forEach((page, idx) => {
-    const head = page.slice(0, 800);
-    if (BANK_HEADERS.some((re) => re.test(head))) starts.push(idx + 1);
+    const sig = bankSignature(page);
+    if (sig && sig !== lastSig) {
+      starts.push({ page: idx + 1, sig });
+      lastSig = sig;
+    }
   });
   if (starts.length <= 1) return [];
   const children: DetectedChild[] = [];
   for (let i = 0; i < starts.length; i++) {
-    const start = starts[i]!;
-    const end = i + 1 < starts.length ? starts[i + 1]! - 1 : pages.length;
-    children.push({ page_start: start, page_end: end });
+    const start = starts[i]!.page;
+    const end = i + 1 < starts.length ? starts[i + 1]!.page - 1 : pages.length;
+    children.push({ page_start: start, page_end: end, marker: starts[i]!.sig });
   }
   return children;
 }

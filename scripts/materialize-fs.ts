@@ -43,6 +43,8 @@ console.log(`DB:       ${dbPath}`);
 await mkdir(OUTPUT_DIR, { recursive: true });
 
 const db = new Database(dbPath, { readonly: true });
+// Skip parents that have been split into children — the children replace them.
+// Detected via extra.split presence (set by split-multi-docs.ts).
 const rows = db
   .query<
     {
@@ -58,6 +60,7 @@ const rows = db
      FROM document_metadata
      WHERE target_classeur IS NOT NULL AND target_filename IS NOT NULL
        AND source_md5 IS NOT NULL
+       AND (extra IS NULL OR json_extract(extra, '$.split') IS NULL)
      ORDER BY target_classeur, target_filename, document_id`,
   )
   .all();
