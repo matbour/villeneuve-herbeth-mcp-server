@@ -1,5 +1,6 @@
 #!/usr/bin/env bun
 import { HerbethClient } from "./client.ts";
+import { MetadataStore } from "./metadata.ts";
 import { startStdio } from "./transports/stdio.ts";
 import { startHttp } from "./transports/http.ts";
 
@@ -13,15 +14,16 @@ if (!username || !password) {
 }
 
 const client = new HerbethClient(username, password);
+const metadata = new MetadataStore(Bun.env.HERBETH_METADATA_DB ?? "./data/metadata.db");
 const transport = (Bun.env.MCP_TRANSPORT ?? "stdio").toLowerCase();
 
 switch (transport) {
   case "stdio":
-    await startStdio(client);
+    await startStdio(client, metadata);
     break;
   case "http":
   case "streamable-http":
-    await startHttp(client);
+    await startHttp(client, metadata);
     break;
   default:
     console.error(

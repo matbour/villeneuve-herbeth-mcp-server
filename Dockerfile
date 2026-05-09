@@ -10,11 +10,16 @@ ENV NODE_ENV=production \
     MCP_TRANSPORT=http \
     HOST=0.0.0.0 \
     PORT=3000 \
-    MCP_DOWNLOAD_RETURN_BASE64=1
+    MCP_DOWNLOAD_RETURN_BASE64=1 \
+    HERBETH_METADATA_DB=/app/data/metadata.db
 
 COPY --from=deps /app/node_modules ./node_modules
 COPY package.json tsconfig.json ./
 COPY src ./src
+
+# Mount this as a persistent volume to keep curated metadata across deploys.
+RUN mkdir -p /app/data && chown -R bun:bun /app/data
+VOLUME ["/app/data"]
 
 EXPOSE 3000
 

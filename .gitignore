@@ -4,3 +4,8 @@ node_modules/
 *.log
 .DS_Store
 bun.lockb
+data/
+*.db
+*.db-journal
+*.db-wal
+*.db-shm

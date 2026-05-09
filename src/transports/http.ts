@@ -2,6 +2,7 @@ import { createServer as createHttpServer, type IncomingMessage, type ServerResp
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { createMcpServer } from "../server.ts";
 import type { HerbethClient } from "../client.ts";
+import type { MetadataStore } from "../metadata.ts";
 
 const MCP_PATH = "/mcp";
 const HEALTH_PATH = "/health";
@@ -23,7 +24,10 @@ async function readJsonBody(req: IncomingMessage): Promise<unknown> {
   return JSON.parse(raw);
 }
 
-export async function startHttp(client: HerbethClient): Promise<void> {
+export async function startHttp(
+  client: HerbethClient,
+  metadata: MetadataStore,
+): Promise<void> {
   const port = Number(Bun.env.PORT ?? 3000);
   const host = Bun.env.HOST ?? "0.0.0.0";
   const token = Bun.env.MCP_AUTH_TOKEN;
@@ -56,7 +60,7 @@ export async function startHttp(client: HerbethClient): Promise<void> {
       const body =
         req.method === "POST" ? await readJsonBody(req).catch(() => undefined) : undefined;
 
-      const server = createMcpServer(client);
+      const server = createMcpServer(client, metadata);
       const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined });
 
       res.on("close", () => {
