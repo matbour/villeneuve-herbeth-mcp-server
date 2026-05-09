@@ -136,15 +136,62 @@ let ocrFailed = 0;
 let textExtracted = 0;
 let alreadyDone = 0;
 
+/** Probe a PDF for an existing text layer. Returns the extracted text. */
+async function probeText(pdfPath: string): Promise<string> {
+  const tmp = `${pdfPath}.probe.txt`;
+  const r = await run(
+    "pdftotext",
+    ["-layout", "-enc", "UTF-8", pdfPath, tmp],
+    60_000,
+  );
+  if (!r.ok || !existsSync(tmp)) return "";
+  try {
+    return await Bun.file(tmp).text();
+  } finally {
+    try { await Bun.file(tmp).unlink(); } catch { /* */ }
+  }
+}
+
+/** Heuristic: treat a PDF as text-native if pdftotext yields enough non-whitespace chars per page. */
+async function pdfHasTextLayer(pdfPath: string): Promise<{ hasText: boolean; text: string }> {
+  const text = await probeText(pdfPath);
+  const meaningful = text.replace(/\s+/g, "").length;
+  // ~150 non-whitespace chars total is a low bar but rules out empty / one-line scans.
+  // Many invoices have several hundred chars per page; a 1-page form has ~50-100.
+  // Be generous: if >150 chars, consider it text-native.
+  return { hasText: meaningful >= 150, text };
+}
+
 async function processOne(job: Job): Promise<void> {
   const sourcePath = `${SOURCES_DIR}/${job.source}`;
 
-  // 1. OCR (if not already)
-  let ocrState: "done" | "skipped" | "failed";
-  if (existsSync(job.ocrPath)) {
-    ocrState = "done";
+  // Short-circuit: if both outputs already exist, mark done.
+  if (existsSync(job.ocrPath) && existsSync(job.textPath) && statSync(job.textPath).size > 0) {
     alreadyDone++;
-  } else {
+    updateOcr.run("done", job.textPath, job.md5);
+    return;
+  }
+
+  // 1. Probe for an existing text layer.
+  const probe = await pdfHasTextLayer(sourcePath);
+
+  if (probe.hasText) {
+    // Text-native PDF — no OCR needed. Just cache the text and link the source.
+    if (!existsSync(job.textPath) || statSync(job.textPath).size === 0) {
+      await Bun.write(job.textPath, probe.text);
+      textExtracted++;
+    }
+    if (!existsSync(job.ocrPath)) {
+      // Symlink the original as the "OCR'd" PDF for downstream tools that expect one.
+      await Bun.write(job.ocrPath, Bun.file(sourcePath));
+    }
+    ocrSkipped++;
+    updateOcr.run("skipped", job.textPath, job.md5);
+    return;
+  }
+
+  // 2. PDF is a scan — run OCR.
+  if (!existsSync(job.ocrPath)) {
     const r = await run(
       "ocrmypdf",
       [
@@ -159,24 +206,22 @@ async function processOne(job: Job): Promise<void> {
       ],
       600_000,
     );
-    ocrState = ocrSucceeded(r);
-    if (ocrState === "done") ocrDone++;
-    else if (ocrState === "skipped") ocrSkipped++;
-    else {
+    const state = ocrSucceeded(r);
+    if (state === "failed") {
       ocrFailed++;
       console.error(`  ✗ ocr failed [${r.code}]: ${job.source}`);
       if (r.stderr.length < 600) console.error(`    ${r.stderr.trim()}`);
       updateOcr.run("failed", null, job.md5);
       return;
     }
+    ocrDone++;
   }
 
-  // 2. Text extraction (use OCR'd PDF if present, else original)
-  const textSource = existsSync(job.ocrPath) ? job.ocrPath : sourcePath;
+  // 3. Re-extract text from the OCR'd PDF.
   if (!existsSync(job.textPath) || statSync(job.textPath).size === 0) {
     const r = await run(
       "pdftotext",
-      ["-layout", "-enc", "UTF-8", textSource, job.textPath],
+      ["-layout", "-enc", "UTF-8", job.ocrPath, job.textPath],
       120_000,
     );
     if (!r.ok) {
@@ -187,7 +232,7 @@ async function processOne(job: Job): Promise<void> {
     textExtracted++;
   }
 
-  updateOcr.run(ocrState, job.textPath, job.md5);
+  updateOcr.run("done", job.textPath, job.md5);
 }
 
 // Worker pool

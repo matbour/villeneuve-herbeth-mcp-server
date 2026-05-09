@@ -301,15 +301,23 @@ const EXTRACTORS: Record<string, (text: string) => Extracted> = {
 // ────────────────────────────────────────────────────────────────────────────
 
 const db = new Database(dbPath, { readwrite: true });
-const rows = db
-  .query<{ document_id: number; doc_type: string | null; ocr_text_path: string | null; extra: string | null }, []>(
-    `SELECT document_id, doc_type, ocr_text_path, extra
-     FROM document_metadata
-     WHERE ocr_text_path IS NOT NULL
-     ${ONLY_TYPE ? "AND doc_type = ?" : ""}
-     ORDER BY document_id`,
-  )
-  .all(...(ONLY_TYPE ? [ONLY_TYPE] : []));
+const rows = ONLY_TYPE
+  ? db
+      .query<{ document_id: number; doc_type: string | null; ocr_text_path: string | null; extra: string | null }, [string]>(
+        `SELECT document_id, doc_type, ocr_text_path, extra
+         FROM document_metadata
+         WHERE ocr_text_path IS NOT NULL AND doc_type = ?
+         ORDER BY document_id`,
+      )
+      .all(ONLY_TYPE)
+  : db
+      .query<{ document_id: number; doc_type: string | null; ocr_text_path: string | null; extra: string | null }, []>(
+        `SELECT document_id, doc_type, ocr_text_path, extra
+         FROM document_metadata
+         WHERE ocr_text_path IS NOT NULL
+         ORDER BY document_id`,
+      )
+      .all();
 db.close();
 
 console.log(`${rows.length} docs with OCR text to re-extract${ONLY_TYPE ? ` (filtering doc_type=${ONLY_TYPE})` : ""}`);
