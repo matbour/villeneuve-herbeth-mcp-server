@@ -43,6 +43,46 @@ MCP_TRANSPORT=http PORT=3000 bun run start
 
 The server is registered for Claude Code via `.mcp.json`.
 
+## Connect from Claude Desktop / Claude Code
+
+Claude Desktop doesn't prompt for HTTP Basic credentials, so the standard
+pattern is to bridge via [`mcp-remote`](https://github.com/geelen/mcp-remote)
+— a small stdio→HTTP MCP shim — and pass an `Authorization` header.
+
+1. Compute your Basic-auth header value:
+
+   ```bash
+   printf 'YOUR_HERBETH_LOGIN:YOUR_HERBETH_PASSWORD' | base64
+   # → e.g. Qk9VUi9OSVpFVDp0ZXBAdWt4...
+   ```
+
+2. Add this to your Claude Desktop config
+   (`~/Library/Application Support/Claude/claude_desktop_config.json` on macOS,
+   `%APPDATA%\Claude\claude_desktop_config.json` on Windows):
+
+   ```json
+   {
+     "mcpServers": {
+       "villeneuve-herbeth": {
+         "command": "npx",
+         "args": [
+           "-y",
+           "mcp-remote",
+           "http://villeneuve-herbeth.bour.io/mcp",
+           "--header",
+           "Authorization: Basic <PASTE_YOUR_BASE64_HERE>"
+         ]
+       }
+     }
+   }
+   ```
+
+3. Restart Claude Desktop. The `villeneuve-herbeth` MCP server should
+   appear under the connected tools list.
+
+The same JSON works for Claude Code's `.mcp.json` (project-scoped) or any
+other stdio-MCP client.
+
 ## Authentication
 
 | Transport | Where credentials come from |
