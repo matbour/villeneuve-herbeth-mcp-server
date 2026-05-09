@@ -832,11 +832,31 @@ export function createMcpServer(
 
   server.tool(
     "import_database",
-    "Restore or merge into the metadata DB from a previous export. " +
-      "Auto-detects format from the file extension (.db / .sqlite → binary restore, .json → JSON merge). " +
-      "Binary restore CLOSES and REPLACES the live DB. JSON import respects the `mode` flag.",
+    "Restore or merge into the metadata DB. Provide EITHER `input_path` (file " +
+      "already on the server's filesystem; format auto-detected from extension) " +
+      "OR `input_base64` (inline upload — required when calling the deployed " +
+      "HTTP server from a remote client). For inline uploads pass `format` " +
+      "explicitly. Binary restore CLOSES and REPLACES the live DB. JSON import " +
+      "respects the `mode` flag.",
     {
-      input_path: z.string().describe("Path to the dump file."),
+      input_path: z
+        .string()
+        .optional()
+        .describe(
+          "Path to a dump file already on the server's filesystem. Mutually exclusive with input_base64.",
+        ),
+      input_base64: z
+        .string()
+        .optional()
+        .describe(
+          "Base64-encoded dump content. Use when uploading from a remote client. Requires `format`.",
+        ),
+      format: z
+        .enum(["sqlite", "json"])
+        .optional()
+        .describe(
+          "Required when using input_base64. Auto-detected from extension when using input_path.",
+        ),
       mode: z
         .enum(["replace", "merge"])
         .default("merge")
@@ -844,28 +864,60 @@ export function createMcpServer(
           "Only applies to JSON imports. 'replace' truncates each table before insert; 'merge' uses INSERT OR REPLACE per row.",
         ),
     },
-    async ({ input_path, mode }) => {
-      const expanded = input_path.startsWith("~/")
-        ? `${homedir()}/${input_path.slice(2)}`
-        : isAbsolute(input_path)
-        ? input_path
-        : resolve(process.cwd(), input_path);
-      const looksJson = /\.json$/i.test(expanded);
-      if (looksJson) {
-        const text = await Bun.file(expanded).text();
-        const data = JSON.parse(text) as { tables: Record<string, unknown[]> };
-        const r = metadata.importJson(data, mode);
-        return {
-          content: [
-            {
-              type: "text",
-              text: JSON.stringify({ format: "json", mode, ...r }, null, 2),
-            },
-          ],
+    async ({ input_path, input_base64, format, mode }) => {
+      if (!input_path && !input_base64) {
+        throw new Error("Provide either input_path or input_base64.");
+      }
+      if (input_path && input_base64) {
+        throw new Error("Provide only one of input_path or input_base64.");
+      }
+
+      // Resolve to a usable file on disk + a known format.
+      let onDisk: string;
+      let resolvedFormat: "sqlite" | "json";
+      let cleanup: (() => Promise<void>) | null = null;
+
+      if (input_path) {
+        onDisk = input_path.startsWith("~/")
+          ? `${homedir()}/${input_path.slice(2)}`
+          : isAbsolute(input_path)
+          ? input_path
+          : resolve(process.cwd(), input_path);
+        resolvedFormat = format ?? (/\.json$/i.test(onDisk) ? "json" : "sqlite");
+      } else {
+        if (!format) {
+          throw new Error("`format` is required when using input_base64.");
+        }
+        resolvedFormat = format;
+        const bytes = Buffer.from(input_base64!, "base64");
+        const tmpDir = `${process.cwd()}/data/.imports`;
+        await mkdir(tmpDir, { recursive: true });
+        onDisk = `${tmpDir}/upload-${Date.now()}-${Math.random().toString(36).slice(2, 8)}.${resolvedFormat === "json" ? "json" : "db"}`;
+        await Bun.write(onDisk, bytes);
+        cleanup = async () => {
+          try { await Bun.file(onDisk).unlink(); } catch { /* */ }
         };
       }
-      const r = metadata.restoreSqlite(expanded);
-      return { content: [{ type: "text", text: JSON.stringify(r, null, 2) }] };
+
+      try {
+        if (resolvedFormat === "json") {
+          const text = await Bun.file(onDisk).text();
+          const data = JSON.parse(text) as { tables: Record<string, unknown[]> };
+          const r = metadata.importJson(data, mode);
+          return {
+            content: [
+              {
+                type: "text",
+                text: JSON.stringify({ format: "json", mode, ...r }, null, 2),
+              },
+            ],
+          };
+        }
+        const r = metadata.restoreSqlite(onDisk);
+        return { content: [{ type: "text", text: JSON.stringify(r, null, 2) }] };
+      } finally {
+        if (cleanup) await cleanup();
+      }
     },
   );
 
