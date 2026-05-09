@@ -1,25 +1,19 @@
 #!/bin/sh
-# docker-entrypoint.sh — fix volume ownership, then drop to the bun user.
+# docker-entrypoint.sh — make /app/data writable, then run the server.
 #
-# Background: when /app/data is bind-mounted from the host, the volume's
-# ownership is whatever the host filesystem says — typically root:root,
-# while the container's `bun` user is uid=1000 and can't write there.
-# The image-time `chown` in the Dockerfile is masked by the mount.
-#
-# This script (running as root) ensures /app/data exists, chowns it to
-# bun:bun, then exec's the real CMD as bun via su-exec.
+# We run as root inside the container. Coolify (and most Docker orchestrators)
+# bind-mount /app/data from a host path that's typically root-owned, so
+# trying to drop to an unprivileged user inside the container fails to
+# write the SQLite file. Running as root sidesteps the volume-ownership
+# question entirely. The image is single-tenant (one MCP server per
+# container) so the security trade-off is small.
 set -e
 
 DATA_DIR="/app/data"
+mkdir -p "$DATA_DIR"
 
-if [ ! -d "$DATA_DIR" ]; then
-  mkdir -p "$DATA_DIR"
-fi
+# Best-effort: ensure something inside the dir is writable in case some
+# orchestrator puts a non-root file in there at startup.
+chmod -R u+rwX "$DATA_DIR" 2>/dev/null || true
 
-# Best-effort. Tolerate read-only mounts and noop on already-correct owners.
-chown -R bun:bun "$DATA_DIR" 2>/dev/null || true
-
-if [ "$(id -u)" = "0" ]; then
-  exec su-exec bun:bun "$@"
-fi
 exec "$@"
