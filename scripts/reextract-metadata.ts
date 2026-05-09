@@ -377,6 +377,45 @@ const EXTRACTORS: Record<string, (text: string) => Extracted> = {
   contract: extractContract,
 };
 
+const FORBIDDEN_FS = /[\\/:*?"<>|]/g;
+function safeFs(s: string): string {
+  return s.replace(FORBIDDEN_FS, "-").replace(/\s+/g, " ").trim();
+}
+
+/** Content-based reclassification: when the text reveals the doc is actually
+ *  a different type than the title-based bulk-annotate guessed, override
+ *  doc_type, target_classeur, target_filename. Returns null if no override.
+ */
+function reclassifyFromContent(text: string): {
+  doc_type: string;
+  target_classeur: string;
+  target_filename: string;
+  title?: string;
+} | null {
+  // FICHE SYNTHÉTIQUE de la copropriété (national registry)
+  // Header always begins with "FICHE SYNTHETIQUE DE LA COPROPRIETE <num>"
+  const ficheMatch = text.match(/FICHE\s+SYNTH[ÉE]TIQUE\s+DE\s+LA\s+COPROPRIETE/i);
+  if (ficheMatch) {
+    // Optional generation date: "générée à partir des données mises à jour le DD/MM/YYYY"
+    const genMatch = text.match(
+      /(?:g[ée]n[ée]r[ée]e?|mises?\s*[àa]\s*jour)[\s\S]{0,80}?(\d{1,2}[\/.\-]\d{1,2}[\/.\-]\d{2,4})/i,
+    );
+    const genDate = genMatch ? parseFrenchDate(genMatch[1]!) : null;
+    const fname = genDate
+      ? `${genDate} - Fiche synthétique copropriété.pdf`
+      : `Fiche synthétique copropriété.pdf`;
+    return {
+      doc_type: "registration_form",
+      target_classeur: "Registre copropriété/Fiches synthétiques",
+      target_filename: safeFs(fname),
+      title: genDate
+        ? `Fiche synthétique copropriété (registre national, MAJ ${genDate})`
+        : "Fiche synthétique copropriété (registre national)",
+    };
+  }
+  return null;
+}
+
 // ────────────────────────────────────────────────────────────────────────────
 // Run
 // ────────────────────────────────────────────────────────────────────────────
@@ -409,14 +448,10 @@ let noExtractor = 0;
 let noText = 0;
 let manuallyCurated = 0;
 
+let reclassified = 0;
 for (const row of rows) {
   if (!row.doc_type) {
     skipped++;
-    continue;
-  }
-  const extractor = EXTRACTORS[row.doc_type];
-  if (!extractor) {
-    noExtractor++;
     continue;
   }
   if (!row.ocr_text_path || !existsSync(row.ocr_text_path)) {
@@ -437,7 +472,26 @@ for (const row of rows) {
   }
 
   const text = readFileSync(row.ocr_text_path, "utf8");
-  const result = extractor(text);
+
+  // Step 1: content-based reclassification — does the text indicate a
+  // doc_type different from what title-based bulk-annotate set?
+  const reclass = reclassifyFromContent(text);
+  let effectiveType = row.doc_type;
+  let typeOverride: { doc_type: string; target_classeur: string; target_filename: string; title?: string } | null = null;
+  if (reclass && reclass.doc_type !== row.doc_type) {
+    effectiveType = reclass.doc_type;
+    typeOverride = reclass;
+    reclassified++;
+  }
+
+  // Step 2: run the extractor for the effective type (if any)
+  const extractor = EXTRACTORS[effectiveType];
+  if (!extractor && !typeOverride) {
+    noExtractor++;
+    continue;
+  }
+  const result = extractor ? extractor(text) : { fields: {}, extraMerge: undefined } as Extracted;
+
   // Always overwrite the extractor-managed fields — null when not extracted —
   // so re-runs after fixing a regex actually clear stale values. Fields not in
   // EXTRACTOR_MANAGED are left untouched (preserving manual curations).
@@ -451,6 +505,12 @@ for (const row of rows) {
   const input: MetadataInput = { document_id: row.document_id };
   for (const k of EXTRACTOR_MANAGED) {
     (input as unknown as Record<string, unknown>)[k] = fields[k] ?? null;
+  }
+  if (typeOverride) {
+    input.doc_type = typeOverride.doc_type;
+    input.target_classeur = typeOverride.target_classeur;
+    input.target_filename = typeOverride.target_filename;
+    if (typeOverride.title) input.title = typeOverride.title;
   }
   if (result.extraMerge) {
     input.extra = { ...parsedExtra, ...result.extraMerge };
@@ -469,6 +529,7 @@ store.close();
 console.log(`\n=== Done ===`);
 console.log(`  rows considered:     ${rows.length}`);
 console.log(`  updated:             ${updated}`);
+console.log(`  reclassified:        ${reclassified}`);
 console.log(`  no extractor:        ${noExtractor} (no implementation for that doc_type)`);
 console.log(`  ocr text missing:    ${noText}`);
 console.log(`  doc_type missing:    ${skipped}`);

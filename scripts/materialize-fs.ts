@@ -60,7 +60,7 @@ const rows = db
      FROM document_metadata
      WHERE target_classeur IS NOT NULL AND target_filename IS NOT NULL
        AND source_md5 IS NOT NULL
-       AND (extra IS NULL OR json_extract(extra, '$.split') IS NULL)
+       AND (extra IS NULL OR (json_extract(extra, '$.split') IS NULL AND json_extract(extra, '$.merged_into') IS NULL))
      ORDER BY target_classeur, target_filename, document_id`,
   )
   .all();
