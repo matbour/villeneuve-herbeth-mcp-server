@@ -710,6 +710,166 @@ export function createMcpServer(
   );
 
   server.tool(
+    "full_text_search",
+    "Run a full-text search (SQLite FTS5) over indexed metadata + OCR text. " +
+      "Returns matched documents with their full curated metadata plus a snippet showing where the match landed. " +
+      "Query syntax: bare terms ('FZ NETTOYAGE'), exact phrase ('\"126-128 Strasbourg\"'), boolean ('cuisine AND extincteur'), prefix ('ascens*'), per-column ('supplier:ATHOME'). " +
+      "If the index seems stale, call `rebuild_search_index` to re-populate.",
+    {
+      query: z
+        .string()
+        .min(1)
+        .describe("FTS5 query. Examples: 'FZ NETTOYAGE', '\"rue Lavéran\"', 'amiante', 'supplier:ATHOME'."),
+      limit: z
+        .number()
+        .int()
+        .positive()
+        .max(500)
+        .optional()
+        .describe("Max results (default 50, max 500)."),
+    },
+    async ({ query, limit }) => {
+      try {
+        const results = metadata.searchFts(query, { limit });
+        return {
+          content: [
+            {
+              type: "text",
+              text: JSON.stringify(
+                {
+                  query,
+                  count: results.length,
+                  results: results.map((r) => ({
+                    rank: r.rank,
+                    snippet: r.snippet,
+                    document: metadataView(r),
+                  })),
+                },
+                null,
+                2,
+              ),
+            },
+          ],
+        };
+      } catch (err) {
+        const msg = (err as Error).message;
+        // Common: "no such table: document_search" if migration was skipped,
+        // or fts5 syntax errors. Surface a friendly hint.
+        throw new Error(
+          msg.includes("no such table")
+            ? "FTS index not present — run `rebuild_search_index` first."
+            : `FTS query failed: ${msg}`,
+        );
+      }
+    },
+  );
+
+  server.tool(
+    "rebuild_search_index",
+    "Re-populate the full-text search index from current document_metadata + OCR text files. " +
+      "Run after a bulk metadata change, after import_database, or when full_text_search reports staleness.",
+    {},
+    async () => {
+      const result = metadata.rebuildFts();
+      return {
+        content: [{ type: "text", text: JSON.stringify(result, null, 2) }],
+      };
+    },
+  );
+
+  server.tool(
+    "export_database",
+    "Export the metadata DB to a file. format='sqlite' (default) produces an atomic, compacted SQLite file via VACUUM INTO — recommended for backups. " +
+      "format='json' produces a portable JSON dump of the document_metadata + suppliers tables. Returns the absolute path + size + per-table row counts.",
+    {
+      output_path: z
+        .string()
+        .describe(
+          "Where to write the dump. Created if missing. For format='sqlite', any existing file is overwritten.",
+        ),
+      format: z
+        .enum(["sqlite", "json"])
+        .default("sqlite")
+        .describe("Output format. 'sqlite' = binary backup; 'json' = portable text dump."),
+    },
+    async ({ output_path, format }) => {
+      const expanded = output_path.startsWith("~/")
+        ? `${homedir()}/${output_path.slice(2)}`
+        : isAbsolute(output_path)
+        ? output_path
+        : resolve(process.cwd(), output_path);
+      if (format === "sqlite") {
+        const r = metadata.exportSqlite(expanded);
+        return { content: [{ type: "text", text: JSON.stringify(r, null, 2) }] };
+      }
+      const json = metadata.exportJson();
+      await mkdir(dirname(expanded), { recursive: true });
+      const text = JSON.stringify(json, null, 2);
+      await Bun.write(expanded, text);
+      return {
+        content: [
+          {
+            type: "text",
+            text: JSON.stringify(
+              {
+                format: "json",
+                path: expanded,
+                bytes: text.length,
+                tables: Object.fromEntries(
+                  Object.entries(json.tables).map(([k, v]) => [k, (v as unknown[]).length]),
+                ),
+                schema_version: json.schema_version,
+                exported_at: json.exported_at,
+              },
+              null,
+              2,
+            ),
+          },
+        ],
+      };
+    },
+  );
+
+  server.tool(
+    "import_database",
+    "Restore or merge into the metadata DB from a previous export. " +
+      "Auto-detects format from the file extension (.db / .sqlite → binary restore, .json → JSON merge). " +
+      "Binary restore CLOSES and REPLACES the live DB. JSON import respects the `mode` flag.",
+    {
+      input_path: z.string().describe("Path to the dump file."),
+      mode: z
+        .enum(["replace", "merge"])
+        .default("merge")
+        .describe(
+          "Only applies to JSON imports. 'replace' truncates each table before insert; 'merge' uses INSERT OR REPLACE per row.",
+        ),
+    },
+    async ({ input_path, mode }) => {
+      const expanded = input_path.startsWith("~/")
+        ? `${homedir()}/${input_path.slice(2)}`
+        : isAbsolute(input_path)
+        ? input_path
+        : resolve(process.cwd(), input_path);
+      const looksJson = /\.json$/i.test(expanded);
+      if (looksJson) {
+        const text = await Bun.file(expanded).text();
+        const data = JSON.parse(text) as { tables: Record<string, unknown[]> };
+        const r = metadata.importJson(data, mode);
+        return {
+          content: [
+            {
+              type: "text",
+              text: JSON.stringify({ format: "json", mode, ...r }, null, 2),
+            },
+          ],
+        };
+      }
+      const r = metadata.restoreSqlite(expanded);
+      return { content: [{ type: "text", text: JSON.stringify(r, null, 2) }] };
+    },
+  );
+
+  server.tool(
     "metadata_stats",
     "Aggregate counts across the curated metadata DB: total annotated docs, breakdown by doc_type, top suppliers, breakdown by target_classeur. Useful to gauge progress building the parallel filesystem.",
     {},

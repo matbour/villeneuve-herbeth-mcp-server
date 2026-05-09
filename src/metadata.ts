@@ -1,5 +1,5 @@
 import { Database } from "bun:sqlite";
-import { mkdirSync } from "node:fs";
+import { copyFileSync, existsSync, mkdirSync, readFileSync, rmSync, statSync } from "node:fs";
 import { dirname, isAbsolute, resolve } from "node:path";
 import { homedir } from "node:os";
 
@@ -207,15 +207,21 @@ function rowToMetadata(row: Row): DocumentMetadata {
 }
 
 export class MetadataStore {
-  private readonly db: Database;
+  private db: Database;
+  private readonly resolvedPath: string;
 
   constructor(dbPath: string) {
-    const resolved = expandPath(dbPath);
-    mkdirSync(dirname(resolved), { recursive: true });
-    this.db = new Database(resolved, { create: true });
+    this.resolvedPath = expandPath(dbPath);
+    mkdirSync(dirname(this.resolvedPath), { recursive: true });
+    this.db = new Database(this.resolvedPath, { create: true });
     this.db.exec("PRAGMA journal_mode = WAL");
     this.db.exec("PRAGMA foreign_keys = ON");
     this.migrate();
+  }
+
+  /** Path to the on-disk SQLite file. */
+  path(): string {
+    return this.resolvedPath;
   }
 
   private migrate(): void {
@@ -312,6 +318,28 @@ export class MetadataStore {
         CREATE INDEX IF NOT EXISTS idx_suppliers_canonical ON suppliers(canonical_name);
       `);
       this.db.exec("PRAGMA user_version = 4");
+    }
+
+    if (version < 5) {
+      // FTS5 virtual table for full-text search over metadata + OCR body.
+      // Populated on demand via rebuildFts(); not auto-synced (we'd otherwise
+      // pay the cost of reading OCR text on every upsert).
+      this.db.exec(`
+        CREATE VIRTUAL TABLE IF NOT EXISTS document_search USING fts5(
+          document_id UNINDEXED,
+          title,
+          notes,
+          supplier,
+          source_title,
+          source_file_name,
+          reference,
+          target_classeur,
+          target_filename,
+          ocr_text,
+          tokenize = 'unicode61 remove_diacritics 2'
+        );
+      `);
+      this.db.exec("PRAGMA user_version = 5");
     }
   }
 
@@ -608,6 +636,210 @@ export class MetadataStore {
       )
       .all();
     return { total, by_doc_type, by_supplier, by_target_classeur };
+  }
+
+  // ──────────────────────────────────────────────────────────────────────────
+  // Export / import
+  // ──────────────────────────────────────────────────────────────────────────
+
+  /** Atomic binary export via VACUUM INTO. Safe with the DB still open;
+   *  the resulting file is a fully self-contained, compacted SQLite database. */
+  exportSqlite(targetPath: string): { format: "sqlite"; path: string; bytes: number; tables: Record<string, number> } {
+    const resolved = expandPath(targetPath);
+    mkdirSync(dirname(resolved), { recursive: true });
+    // VACUUM INTO refuses to overwrite an existing file
+    if (existsSync(resolved)) rmSync(resolved);
+    this.db.exec(`VACUUM INTO '${resolved.replace(/'/g, "''")}'`);
+    return {
+      format: "sqlite",
+      path: resolved,
+      bytes: statSync(resolved).size,
+      tables: this.tableCounts(),
+    };
+  }
+
+  /** Restore the live DB from a binary SQLite file. Closes and re-opens. */
+  restoreSqlite(sourcePath: string): { restored_from: string; bytes: number; tables: Record<string, number> } {
+    const resolved = expandPath(sourcePath);
+    if (!existsSync(resolved)) throw new Error(`No such file: ${resolved}`);
+    this.db.exec("PRAGMA wal_checkpoint(TRUNCATE)");
+    this.db.close();
+    copyFileSync(resolved, this.resolvedPath);
+    // Drop any leftover -wal / -shm sidecars from the old DB so the freshly
+    // copied file is read in isolation.
+    for (const ext of ["-wal", "-shm"]) {
+      const sidecar = `${this.resolvedPath}${ext}`;
+      if (existsSync(sidecar)) rmSync(sidecar);
+    }
+    this.db = new Database(this.resolvedPath, { readwrite: true });
+    this.db.exec("PRAGMA journal_mode = WAL");
+    this.db.exec("PRAGMA foreign_keys = ON");
+    this.migrate();
+    return {
+      restored_from: resolved,
+      bytes: statSync(this.resolvedPath).size,
+      tables: this.tableCounts(),
+    };
+  }
+
+  /** Dump the DB as a plain JSON object (lossless for our schema). */
+  exportJson(): {
+    format: "json";
+    schema_version: number;
+    exported_at: string;
+    tables: Record<string, unknown[]>;
+  } {
+    const v =
+      this.db.query<{ user_version: number }, []>("PRAGMA user_version").get()
+        ?.user_version ?? 0;
+    return {
+      format: "json",
+      schema_version: v,
+      exported_at: new Date().toISOString(),
+      tables: {
+        document_metadata: this.db
+          .query("SELECT * FROM document_metadata")
+          .all() as unknown[],
+        suppliers: this.db.query("SELECT * FROM suppliers").all() as unknown[],
+      },
+    };
+  }
+
+  /** Import a JSON dump produced by exportJson(). mode='replace' truncates
+   *  before insert; mode='merge' uses INSERT OR REPLACE on each row. */
+  importJson(
+    data: { tables: Record<string, unknown[]> },
+    mode: "replace" | "merge" = "merge",
+  ): { tables: Record<string, number> } {
+    const counts: Record<string, number> = {};
+    const importTables = (tables: Record<string, unknown[]>) => {
+      for (const [tableName, rows] of Object.entries(tables)) {
+        if (tableName !== "document_metadata" && tableName !== "suppliers") continue;
+        if (mode === "replace") this.db.exec(`DELETE FROM ${tableName}`);
+        let count = 0;
+        for (const r of rows) {
+          const row = r as Record<string, unknown>;
+          const cols = Object.keys(row);
+          const placeholders = cols.map(() => "?").join(",");
+          const values = cols.map((c) => row[c] as unknown) as never[];
+          this.db
+            .query(
+              `INSERT OR REPLACE INTO ${tableName} (${cols.map((c) => `"${c}"`).join(",")}) VALUES (${placeholders})`,
+            )
+            .run(...values);
+          count++;
+        }
+        counts[tableName] = count;
+      }
+    };
+    const tx = this.db.transaction(importTables);
+    tx(data.tables);
+    return { tables: counts };
+  }
+
+  // ──────────────────────────────────────────────────────────────────────────
+  // Full-text search
+  // ──────────────────────────────────────────────────────────────────────────
+
+  /** Re-build the FTS5 index from current document_metadata + OCR text files. */
+  rebuildFts(): { indexed: number; ocr_loaded: number; ocr_missing: number } {
+    this.db.exec("DELETE FROM document_search");
+    const rows = this.db
+      .query<
+        {
+          document_id: number;
+          title: string | null;
+          notes: string | null;
+          supplier: string | null;
+          source_title: string | null;
+          source_file_name: string | null;
+          reference: string | null;
+          target_classeur: string | null;
+          target_filename: string | null;
+          ocr_text_path: string | null;
+        },
+        []
+      >(
+        `SELECT document_id, title, notes, supplier, source_title, source_file_name,
+                reference, target_classeur, target_filename, ocr_text_path
+         FROM document_metadata`,
+      )
+      .all();
+    let ocrLoaded = 0;
+    let ocrMissing = 0;
+    const insert = this.db.prepare<unknown, [number, string, string, string, string, string, string, string, string, string]>(
+      `INSERT INTO document_search (
+        document_id, title, notes, supplier, source_title, source_file_name,
+        reference, target_classeur, target_filename, ocr_text
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    );
+    const ingestAll = this.db.transaction(() => {
+      for (const r of rows) {
+        let ocrText = "";
+        if (r.ocr_text_path) {
+          try {
+            ocrText = readFileSync(r.ocr_text_path, "utf8");
+            ocrLoaded++;
+          } catch {
+            ocrMissing++;
+          }
+        }
+        insert.run(
+          r.document_id,
+          r.title ?? "",
+          r.notes ?? "",
+          r.supplier ?? "",
+          r.source_title ?? "",
+          r.source_file_name ?? "",
+          r.reference ?? "",
+          r.target_classeur ?? "",
+          r.target_filename ?? "",
+          ocrText,
+        );
+      }
+    });
+    ingestAll();
+    return { indexed: rows.length, ocr_loaded: ocrLoaded, ocr_missing: ocrMissing };
+  }
+
+  /** FTS5 query. Accepts standard fts5 query syntax (e.g. "FZ NETTOYAGE",
+   *  "Lavéran NEAR/5 garage", '"126-128 Strasbourg"', "supplier:ATHOME").
+   *  Returns the matched documents with their full metadata + a snippet. */
+  searchFts(
+    query: string,
+    options: { limit?: number; columns?: string[] } = {},
+  ): Array<DocumentMetadata & { snippet: string; rank: number }> {
+    const limit = Math.min(Math.max(options.limit ?? 50, 1), 500);
+    // snippet(table, col_index, prefix, suffix, ellipsis, max_tokens)
+    const sql = `
+      SELECT s.document_id AS doc_id,
+             snippet(document_search, -1, '«', '»', ' … ', 16) AS snippet,
+             bm25(document_search) AS rank
+      FROM document_search s
+      WHERE document_search MATCH ?
+      ORDER BY rank
+      LIMIT ${limit}
+    `;
+    const hits = this.db
+      .query<{ doc_id: number; snippet: string; rank: number }, [string]>(sql)
+      .all(query);
+    const out: Array<DocumentMetadata & { snippet: string; rank: number }> = [];
+    for (const h of hits) {
+      const meta = this.get(h.doc_id);
+      if (!meta) continue;
+      out.push({ ...meta, snippet: h.snippet, rank: h.rank });
+    }
+    return out;
+  }
+
+  private tableCounts(): Record<string, number> {
+    const out: Record<string, number> = {};
+    for (const t of ["document_metadata", "suppliers", "document_search"]) {
+      try {
+        out[t] = this.db.query<{ c: number }, []>(`SELECT COUNT(*) c FROM ${t}`).get()?.c ?? 0;
+      } catch { /* table missing pre-migration */ }
+    }
+    return out;
   }
 
   close(): void {
