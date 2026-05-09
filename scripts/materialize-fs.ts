@@ -1,120 +1,143 @@
 #!/usr/bin/env bun
 /**
- * Materialize the parallel filesystem from curated metadata.
+ * Materialize the curated parallel filesystem from the metadata DB +
+ * the local source mirror.
  *
- * Walks every row in the metadata DB and downloads the source document into
- *   <output_dir>/<target_classeur>/<target_filename>
+ *   <output_dir>/<target_classeur>/<target_filename>   ← copy of the source PDF
  *
- * Idempotent: skips files already on disk. Detects (and avoids) cross-doc
- * filename collisions by appending the source document_id to the filename
- * when two different docs would otherwise land at the same path.
+ * Source PDFs are read from ./data/sources/<md5>__<original_filename>.
+ * Run scripts/download-sources.ts first to populate the mirror.
+ *
+ * Idempotent. Detects cross-doc filename collisions (different docs that
+ * would land at the same path) and disambiguates by appending the source
+ * document_id to the filename.
  *
  * Usage:
- *   bun scripts/materialize-fs.ts [output_dir]
+ *   bun scripts/materialize-fs.ts [output_dir] [sources_dir]
  *
- * Default output_dir: ~/Downloads/Villeneuve - Copropriété
+ * Defaults: output_dir=./data/output, sources_dir=./data/sources
  */
 import { Database } from "bun:sqlite";
-import { mkdir } from "node:fs/promises";
+import { mkdir, copyFile } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import { homedir } from "node:os";
 import { isAbsolute, resolve } from "node:path";
-import { HerbethClient } from "../src/client.ts";
-
-const username = Bun.env.HERBETH_USERNAME;
-const password = Bun.env.HERBETH_PASSWORD;
-if (!username || !password) {
-  console.error("Missing HERBETH_USERNAME / HERBETH_PASSWORD");
-  process.exit(1);
-}
 
 function expandPath(p: string): string {
   const expanded = p.startsWith("~/") ? `${homedir()}/${p.slice(2)}` : p;
   return isAbsolute(expanded) ? expanded : resolve(process.cwd(), expanded);
 }
 
-const argDir = Bun.argv[2];
-const OUTPUT_DIR = expandPath(argDir ?? "~/Downloads/Villeneuve - Copropriété");
-const CONCURRENCY = 4;
+const FORBIDDEN = /[\\/:*?"<>| ]/g;
+function safeFs(s: string): string {
+  return s.replace(FORBIDDEN, "_");
+}
+
+const OUTPUT_DIR = expandPath(Bun.argv[2] ?? "./data/output");
+const SOURCES_DIR = expandPath(Bun.argv[3] ?? "./data/sources");
 const dbPath = expandPath(Bun.env.HERBETH_METADATA_DB ?? "./data/metadata.db");
 
-console.log(`DB: ${dbPath}`);
-console.log(`Output: ${OUTPUT_DIR}`);
+console.log(`Output:   ${OUTPUT_DIR}`);
+console.log(`Sources:  ${SOURCES_DIR}`);
+console.log(`DB:       ${dbPath}`);
 await mkdir(OUTPUT_DIR, { recursive: true });
 
-const client = new HerbethClient(username, password);
-
-const raw = new Database(dbPath, { readonly: true });
-const rows = raw
+const db = new Database(dbPath, { readonly: true });
+const rows = db
   .query<
-    { document_id: number; target_classeur: string; target_filename: string },
+    {
+      document_id: number;
+      target_classeur: string;
+      target_filename: string;
+      source_file_name: string | null;
+      source_md5: string | null;
+    },
     []
   >(
-    `SELECT document_id, target_classeur, target_filename
+    `SELECT document_id, target_classeur, target_filename, source_file_name, source_md5
      FROM document_metadata
      WHERE target_classeur IS NOT NULL AND target_filename IS NOT NULL
+       AND source_md5 IS NOT NULL
      ORDER BY target_classeur, target_filename, document_id`,
   )
   .all();
-raw.close();
+db.close();
 
 console.log(`${rows.length} docs to materialize`);
+const skippedNoMd5 = (() => {
+  const all = new Database(dbPath, { readonly: true })
+    .query<{ c: number }, []>(
+      "SELECT COUNT(*) c FROM document_metadata WHERE target_classeur IS NOT NULL AND target_filename IS NOT NULL AND source_md5 IS NULL",
+    )
+    .get();
+  return all?.c ?? 0;
+})();
+if (skippedNoMd5 > 0) {
+  console.warn(
+    `  ⚠ ${skippedNoMd5} docs have target_filename but no source_md5 — run download-sources.ts first.`,
+  );
+}
 
-// Detect path collisions across rows (different docs → same path); disambiguate by id.
-const planned: Array<{ document_id: number; path: string }> = [];
-const usedPaths = new Map<string, number>();
+interface PlannedItem {
+  document_id: number;
+  source: string;
+  dest: string;
+}
+const planned: PlannedItem[] = [];
+const usedDest = new Map<string, number>();
+let unresolved = 0;
+
 for (const r of rows) {
-  let path = `${OUTPUT_DIR}/${r.target_classeur}/${r.target_filename}`;
-  if (usedPaths.has(path)) {
+  if (!r.source_md5 || !r.source_file_name) {
+    unresolved++;
+    continue;
+  }
+  const source = `${SOURCES_DIR}/${r.source_md5}__${safeFs(r.source_file_name)}`;
+  if (!existsSync(source)) {
+    unresolved++;
+    if (unresolved <= 5) console.warn(`  ⚠ source missing: ${source}`);
+    continue;
+  }
+  let dest = `${OUTPUT_DIR}/${r.target_classeur}/${r.target_filename}`;
+  if (usedDest.has(dest)) {
     const dot = r.target_filename.lastIndexOf(".");
     const stem = dot >= 0 ? r.target_filename.slice(0, dot) : r.target_filename;
     const ext = dot >= 0 ? r.target_filename.slice(dot) : ".pdf";
-    path = `${OUTPUT_DIR}/${r.target_classeur}/${stem} - id${r.document_id}${ext}`;
+    dest = `${OUTPUT_DIR}/${r.target_classeur}/${stem} - id${r.document_id}${ext}`;
   }
-  usedPaths.set(path, r.document_id);
-  planned.push({ document_id: r.document_id, path });
+  usedDest.set(dest, r.document_id);
+  planned.push({ document_id: r.document_id, source, dest });
 }
 
-let done = 0;
-let skipped = 0;
+let copied = 0;
+let alreadyThere = 0;
 let failed = 0;
 
-async function materializeOne(item: typeof planned[number]): Promise<void> {
-  if (existsSync(item.path)) {
-    skipped++;
-    return;
+for (const item of planned) {
+  if (existsSync(item.dest)) {
+    alreadyThere++;
+    continue;
   }
   try {
-    const { bytes } = await client.downloadFile(item.document_id);
-    const dir = item.path.slice(0, item.path.lastIndexOf("/"));
+    const dir = item.dest.slice(0, item.dest.lastIndexOf("/"));
     await mkdir(dir, { recursive: true });
-    await Bun.write(item.path, bytes);
-    done++;
+    await copyFile(item.source, item.dest);
+    copied++;
   } catch (err) {
     failed++;
-    console.error(`✗ ${item.document_id} → ${item.path}: ${(err as Error).message}`);
+    console.error(`  ✗ ${item.document_id}: ${(err as Error).message}`);
+  }
+  const total = copied + alreadyThere + failed;
+  if (total % 50 === 0) {
+    console.log(
+      `  progress: ${total}/${planned.length} (copied=${copied} already=${alreadyThere} failed=${failed})`,
+    );
   }
 }
-
-const queue = [...planned];
-const workers: Promise<void>[] = [];
-async function worker(): Promise<void> {
-  while (queue.length > 0) {
-    const item = queue.shift();
-    if (!item) return;
-    await materializeOne(item);
-    const total = done + skipped + failed;
-    if (total % 25 === 0) {
-      console.log(
-        `  progress: ${total}/${planned.length} (downloaded ${done}, skipped ${skipped}, failed ${failed})`,
-      );
-    }
-  }
-}
-for (let i = 0; i < CONCURRENCY; i++) workers.push(worker());
-await Promise.all(workers);
 
 console.log(`\n=== Done ===`);
-console.log(`  downloaded: ${done}`);
-console.log(`  skipped (already on disk): ${skipped}`);
-console.log(`  failed: ${failed}`);
+console.log(`  planned:           ${planned.length}`);
+console.log(`  copied:            ${copied}`);
+console.log(`  already on disk:   ${alreadyThere}`);
+console.log(`  failed:            ${failed}`);
+console.log(`  unresolved (no source/md5 missing): ${unresolved}`);

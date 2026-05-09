@@ -47,6 +47,11 @@ export interface DocumentMetadata {
   source_title: string | null;
   source_classeur_id: number | null;
   source_date_commit: string | null;
+  source_md5: string | null;
+  parent_document_id: number | null;
+  parent_page_range: string | null;
+  ocr_status: string | null;
+  ocr_text_path: string | null;
   created_at: string;
   updated_at: string;
 }
@@ -75,6 +80,20 @@ export interface MetadataInput {
   source_title?: string | null;
   source_classeur_id?: number | null;
   source_date_commit?: string | null;
+  source_md5?: string | null;
+  parent_document_id?: number | null;
+  parent_page_range?: string | null;
+  ocr_status?: string | null;
+  ocr_text_path?: string | null;
+}
+
+export interface SupplierEntry {
+  id: number;
+  canonical_name: string;
+  pattern: string;
+  priority: number;
+  created_at: string;
+  updated_at: string;
 }
 
 export interface SearchFilters {
@@ -116,6 +135,11 @@ interface Row {
   source_title: string | null;
   source_classeur_id: number | null;
   source_date_commit: string | null;
+  source_md5: string | null;
+  parent_document_id: number | null;
+  parent_page_range: string | null;
+  ocr_status: string | null;
+  ocr_text_path: string | null;
   created_at: string;
   updated_at: string;
 }
@@ -172,6 +196,11 @@ function rowToMetadata(row: Row): DocumentMetadata {
     source_title: row.source_title,
     source_classeur_id: row.source_classeur_id,
     source_date_commit: row.source_date_commit,
+    source_md5: row.source_md5,
+    parent_document_id: row.parent_document_id,
+    parent_page_range: row.parent_page_range,
+    ocr_status: row.ocr_status,
+    ocr_text_path: row.ocr_text_path,
     created_at: row.created_at,
     updated_at: row.updated_at,
   };
@@ -217,16 +246,17 @@ export class MetadataStore {
       (this.db.query<{ user_version: number }, []>("PRAGMA user_version").get()
         ?.user_version ?? 0);
 
-    if (version < 2) {
-      const existing = this.db
+    const addCol = (col: string, type: string) => {
+      const cols = this.db
         .query<{ name: string }, []>("PRAGMA table_info(document_metadata)")
         .all()
         .map((r) => r.name);
-      const addCol = (col: string, type: string) => {
-        if (!existing.includes(col)) {
-          this.db.exec(`ALTER TABLE document_metadata ADD COLUMN ${col} ${type}`);
-        }
-      };
+      if (!cols.includes(col)) {
+        this.db.exec(`ALTER TABLE document_metadata ADD COLUMN ${col} ${type}`);
+      }
+    };
+
+    if (version < 2) {
       addCol("doc_type", "TEXT");
       addCol("target_classeur", "TEXT");
       addCol("target_filename", "TEXT");
@@ -248,6 +278,92 @@ export class MetadataStore {
       );
       this.db.exec("PRAGMA user_version = 2");
     }
+
+    if (version < 3) {
+      addCol("source_md5", "TEXT");
+      addCol("parent_document_id", "INTEGER");
+      addCol("parent_page_range", "TEXT");
+      addCol("ocr_status", "TEXT");
+      addCol("ocr_text_path", "TEXT");
+      this.db.exec(
+        "CREATE INDEX IF NOT EXISTS idx_doc_meta_md5 ON document_metadata(source_md5)",
+      );
+      this.db.exec(
+        "CREATE INDEX IF NOT EXISTS idx_doc_meta_parent ON document_metadata(parent_document_id)",
+      );
+      this.db.exec(
+        "CREATE INDEX IF NOT EXISTS idx_doc_meta_ocr_status ON document_metadata(ocr_status)",
+      );
+      this.db.exec("PRAGMA user_version = 3");
+    }
+
+    if (version < 4) {
+      this.db.exec(`
+        CREATE TABLE IF NOT EXISTS suppliers (
+          id              INTEGER PRIMARY KEY AUTOINCREMENT,
+          canonical_name  TEXT NOT NULL,
+          pattern         TEXT NOT NULL,
+          priority        INTEGER NOT NULL DEFAULT 100,
+          created_at      TEXT NOT NULL DEFAULT (datetime('now')),
+          updated_at      TEXT NOT NULL DEFAULT (datetime('now')),
+          UNIQUE(canonical_name, pattern)
+        );
+        CREATE INDEX IF NOT EXISTS idx_suppliers_priority ON suppliers(priority);
+        CREATE INDEX IF NOT EXISTS idx_suppliers_canonical ON suppliers(canonical_name);
+      `);
+      this.db.exec("PRAGMA user_version = 4");
+    }
+  }
+
+  // ──────────────────────────────────────────────────────────────────────────
+  // Suppliers table
+  // ──────────────────────────────────────────────────────────────────────────
+
+  listSuppliers(): SupplierEntry[] {
+    return this.db
+      .query<SupplierEntry, []>(
+        "SELECT id, canonical_name, pattern, priority, created_at, updated_at FROM suppliers ORDER BY priority ASC, canonical_name ASC",
+      )
+      .all();
+  }
+
+  addSupplier(input: { canonical_name: string; pattern: string; priority?: number }): SupplierEntry {
+    const priority = input.priority ?? 100;
+    this.db
+      .query(
+        `INSERT INTO suppliers (canonical_name, pattern, priority)
+         VALUES (?, ?, ?)
+         ON CONFLICT(canonical_name, pattern) DO UPDATE SET
+           priority = excluded.priority,
+           updated_at = datetime('now')`,
+      )
+      .run(input.canonical_name, input.pattern, priority);
+    const row = this.db
+      .query<SupplierEntry, [string, string]>(
+        "SELECT id, canonical_name, pattern, priority, created_at, updated_at FROM suppliers WHERE canonical_name = ? AND pattern = ?",
+      )
+      .get(input.canonical_name, input.pattern);
+    if (!row) throw new Error("addSupplier: failed to read back row");
+    return row;
+  }
+
+  deleteSupplier(id: number): boolean {
+    return this.db.query("DELETE FROM suppliers WHERE id = ?").run(id).changes > 0;
+  }
+
+  /** Try to canonicalize a raw supplier prefix using stored regex patterns. */
+  canonicalizeSupplier(rawPrefix: string): string | null {
+    const trimmed = rawPrefix.trim();
+    if (!trimmed) return null;
+    for (const s of this.listSuppliers()) {
+      try {
+        const re = new RegExp(s.pattern, "i");
+        if (re.test(trimmed)) return s.canonical_name;
+      } catch {
+        /* skip invalid pattern */
+      }
+    }
+    return null;
   }
 
   get(documentId: number): DocumentMetadata | null {
@@ -303,6 +419,11 @@ export class MetadataStore {
       source_title: pick(input.source_title, existing?.source_title),
       source_classeur_id: pick(input.source_classeur_id, existing?.source_classeur_id),
       source_date_commit: pick(input.source_date_commit, existing?.source_date_commit),
+      source_md5: pick(input.source_md5, existing?.source_md5),
+      parent_document_id: pick(input.parent_document_id, existing?.parent_document_id),
+      parent_page_range: pick(input.parent_page_range, existing?.parent_page_range),
+      ocr_status: pick(input.ocr_status, existing?.ocr_status),
+      ocr_text_path: pick(input.ocr_text_path, existing?.ocr_text_path),
     };
 
     const tagsJson =
@@ -321,9 +442,10 @@ export class MetadataStore {
           document_date, period_start, period_end, reference, language,
           tags, notes, extra,
           source_file_name, source_title, source_classeur_id, source_date_commit,
+          source_md5, parent_document_id, parent_page_range, ocr_status, ocr_text_path,
           created_at, updated_at
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
                 datetime('now'), datetime('now'))
         ON CONFLICT(document_id) DO UPDATE SET
           doc_type           = excluded.doc_type,
@@ -348,6 +470,11 @@ export class MetadataStore {
           source_title       = excluded.source_title,
           source_classeur_id = excluded.source_classeur_id,
           source_date_commit = excluded.source_date_commit,
+          source_md5         = excluded.source_md5,
+          parent_document_id = excluded.parent_document_id,
+          parent_page_range  = excluded.parent_page_range,
+          ocr_status         = excluded.ocr_status,
+          ocr_text_path      = excluded.ocr_text_path,
           updated_at         = datetime('now')
         `,
       )
@@ -375,6 +502,11 @@ export class MetadataStore {
         merged.source_title,
         merged.source_classeur_id,
         merged.source_date_commit,
+        merged.source_md5,
+        merged.parent_document_id,
+        merged.parent_page_range,
+        merged.ocr_status,
+        merged.ocr_text_path,
       );
 
     const result = this.get(input.document_id);

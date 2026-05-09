@@ -124,49 +124,31 @@ function frenchMonthName(month: number): string {
 }
 
 // ────────────────────────────────────────────────────────────────────────────
-// Supplier normalization (factures)
+// Supplier normalization — backed by the DB `suppliers` table.
+// Run `bun scripts/seed-suppliers.ts` to populate or extend the table.
 // ────────────────────────────────────────────────────────────────────────────
 
-const SUPPLIER_CANON: Array<[RegExp, string]> = [
-  [/^ATHOME$/i, "ATHOME"],
-  [/^ILEX$/i, "ILEX LORRAINE"],
-  [/^FZ$/i, "FZ NETTOYAGE"],
-  [/^GAZ EUROPEEN$/i, "GAZ EUROPEEN"],
-  [/^CDR MAINTENANCE$/i, "CDR MAINTENANCE"],
-  [/^UEM$/i, "UEM"],
-  [/^THEMEL( PREVENTION)?$/i, "THEMEL"],
-  [/^ISTA$/i, "ISTA"],
-  [/^LOMANTO$/i, "LOMANTO"],
-  [/^SOTECO$/i, "SOTECO"],
-  [/^(SAS )?SERRURERIE AUSESKY( SAS)?$/i, "SAS SERRURERIE AUSESKY"],
-  [/^AUSESKY$/i, "SAS SERRURERIE AUSESKY"],
-  [/^SL SANITAIRE$/i, "SL SANITAIRE"],
-  [/^MDE$/i, "MDE"],
-  [/^SANISOLAIRE?$/i, "SANISOLAIR"],
-  [/^HYDROCLEAN( ASSAINISSEMENT)?$/i, "HYDROCLEAN ASSAINISSEMENT"],
-  [/^GAN$/i, "GAN ASSURANCES"],
-  [/^FRITZINGER$/i, "FRITZINGER"],
-  [/^TALON SERVICE$/i, "TALON SERVICE"],
-  [/^SPANNAGEL Gilles$/i, "SPANNAGEL Gilles"],
-  [/^PFF FACADE$/i, "PFF FACADE"],
-  [/^EUROFEU$/i, "EUROFEU"],
-  [/^AB SAV$/i, "AB SAV"],
-  [/^SCHERTZ( AMENAGEMENTS)?$/i, "SCHERTZ AMENAGEMENTS"],
-  [/^MALEZIEUX/i, "MALEZIEUX"],
-  [/^IN ARBORIS$/i, "IN ARBORIS"],
-  [/^HYGIENE EST PEST CONTROL$/i, "HYGIENE EST PEST CONTROL"],
-  [/^METRONA$/i, "METRONA"],
-  [/^NUMERICABLE$/i, "NUMERICABLE"],
-  [/^LA CAISSE A OUTILS$/i, "LA CAISSE A OUTILS"],
-  [/^GAM ETANCHE$/i, "GAM ETANCHE"],
-  [/^AS ETANCHEITE$/i, "AS ETANCHEITE"],
-  [/^ARDF$/i, "ARDF"],
-  [/^BURGER( PEINTURE)?$/i, "BURGER PEINTURE"],
-];
+const SUPPLIER_PATTERNS = store.listSuppliers().map((s) => ({
+  re: (() => {
+    try {
+      return new RegExp(s.pattern, "i");
+    } catch {
+      return null;
+    }
+  })(),
+  canonical_name: s.canonical_name,
+}));
+
+if (SUPPLIER_PATTERNS.length === 0) {
+  console.warn(
+    "  ⚠ suppliers table is empty — supplier names will not be canonicalized.\n" +
+      "    Run `bun scripts/seed-suppliers.ts` first.",
+  );
+}
 
 function canonicalSupplier(rawPrefix: string): string | null {
-  for (const [re, canon] of SUPPLIER_CANON) {
-    if (re.test(rawPrefix)) return canon;
+  for (const { re, canonical_name } of SUPPLIER_PATTERNS) {
+    if (re && re.test(rawPrefix.trim())) return canonical_name;
   }
   return null;
 }

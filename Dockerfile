@@ -6,6 +6,21 @@ RUN bun install --frozen-lockfile --production
 
 FROM oven/bun:1.3-alpine AS runtime
 WORKDIR /app
+
+# OCR + PDF tooling for the bulk-annotate / OCR pipeline:
+#   - ocrmypdf wraps tesseract to produce searchable PDFs from scans
+#   - tesseract-ocr-data-fra adds the French language model
+#   - poppler-utils provides pdftotext / pdfinfo / pdftoppm
+#   - qpdf is used to split multi-document PDFs page-range by page-range
+#   - ghostscript is required by ocrmypdf for PDF/A output
+RUN apk add --no-cache \
+    ocrmypdf \
+    tesseract-ocr-data-fra \
+    tesseract-ocr-data-eng \
+    poppler-utils \
+    qpdf \
+    ghostscript \
+    unpaper
 ENV NODE_ENV=production \
     MCP_TRANSPORT=http \
     HOST=0.0.0.0 \

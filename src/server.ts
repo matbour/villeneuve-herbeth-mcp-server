@@ -631,6 +631,85 @@ export function createMcpServer(
   );
 
   server.tool(
+    "list_suppliers",
+    "List every entry in the suppliers canonicalization table. Each row maps a regex pattern (case-insensitive) to a canonical_name. Used by the bulk-annotate pipeline to normalize varied supplier prefixes (\"FZ\", \"FZ Nettoyage\", \"FZ NETTOYAGE\") into a single canonical name. Lower priority = checked first.",
+    {},
+    async () => {
+      return {
+        content: [
+          {
+            type: "text",
+            text: JSON.stringify({ suppliers: metadata.listSuppliers() }, null, 2),
+          },
+        ],
+      };
+    },
+  );
+
+  server.tool(
+    "add_supplier",
+    "Add or update a supplier canonicalization rule. Maps a regex `pattern` (case-insensitive) to a `canonical_name`. Lower `priority` is checked first when canonicalizing. Idempotent on (canonical_name, pattern).",
+    {
+      canonical_name: z
+        .string()
+        .min(1)
+        .describe("Canonical supplier name to use everywhere (e.g. \"FZ NETTOYAGE\")."),
+      pattern: z
+        .string()
+        .min(1)
+        .describe(
+          "Regex pattern matched case-insensitively against the raw supplier prefix (e.g. \"^FZ$\" or \"^FZ( NETTOYAGE)?$\").",
+        ),
+      priority: z
+        .number()
+        .int()
+        .optional()
+        .describe("Lower = checked first. Default 100. Use 50 for more-specific patterns."),
+    },
+    async ({ canonical_name, pattern, priority }) => {
+      try {
+        new RegExp(pattern, "i");
+      } catch (err) {
+        throw new Error(`Invalid regex pattern: ${(err as Error).message}`);
+      }
+      const saved = metadata.addSupplier({ canonical_name, pattern, priority });
+      return {
+        content: [{ type: "text", text: JSON.stringify({ saved }, null, 2) }],
+      };
+    },
+  );
+
+  server.tool(
+    "delete_supplier",
+    "Delete a supplier canonicalization rule by id (use list_suppliers to find ids).",
+    {
+      id: z.number().int().positive().describe("Supplier rule id."),
+    },
+    async ({ id }) => {
+      const deleted = metadata.deleteSupplier(id);
+      return {
+        content: [{ type: "text", text: JSON.stringify({ id, deleted }, null, 2) }],
+      };
+    },
+  );
+
+  server.tool(
+    "canonicalize_supplier",
+    "Look up the canonical supplier name for a raw input string. Returns null if no rule matches. Useful to test patterns or to canonicalize ad-hoc.",
+    {
+      raw: z.string().min(1).describe("Raw supplier prefix from a document title or file."),
+    },
+    async ({ raw }) => {
+      const canonical = metadata.canonicalizeSupplier(raw);
+      return {
+        content: [
+          { type: "text", text: JSON.stringify({ raw, canonical }, null, 2) },
+        ],
+      };
+    },
+  );
+
+  server.tool(
     "metadata_stats",
     "Aggregate counts across the curated metadata DB: total annotated docs, breakdown by doc_type, top suppliers, breakdown by target_classeur. Useful to gauge progress building the parallel filesystem.",
     {},
