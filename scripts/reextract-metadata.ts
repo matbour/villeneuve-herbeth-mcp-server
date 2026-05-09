@@ -382,6 +382,38 @@ function safeFs(s: string): string {
   return s.replace(FORBIDDEN_FS, "-").replace(/\s+/g, " ").trim();
 }
 
+/** Identify a contract subtype from a syndic acceptance letter. The body
+ *  always contains "votre contrat <pour|d'entretien|...> ..." which names
+ *  the actual subject of the contract. Returns the bucket name + a short
+ *  human-readable label, or null. */
+function detectContractSubtype(text: string): { bucket: string; label: string } | null {
+  // Common patterns in the syndic's acceptance letters
+  const patterns: Array<[RegExp, string, string]> = [
+    [/contrat\s+pour\s+la\s+fourniture\s+de\s+gaz|contrat\s+(?:de\s+)?gaz\b/i, "Gaz", "Contrat fourniture de gaz"],
+    [/contrat\s+(?:pour\s+la\s+)?fourniture\s+d['']?\s*[ée]lectricit[ée]/i, "Électricité", "Contrat fourniture d'électricité"],
+    [/contrat\s+d['']?entretien\s+des?\s+toitures?\s+terrasses?/i, "Entretien toitures", "Contrat entretien toitures terrasses"],
+    [/contrat\s+d['']?entretien\s+des?\s+(?:parties\s+communes|pc\b)/i, "Entretien parties communes", "Contrat entretien parties communes"],
+    [/validation\s+contrat\s+entretien\s+pc/i, "Entretien parties communes", "Contrat entretien parties communes"],
+    [/contrat\s+d['']?entretien\s+(?:d['']?)?ascenseur/i, "Entretien ascenseurs", "Contrat entretien ascenseur"],
+    [/contrat\s+d['']?entretien\s+(?:de\s+la\s+)?chaufferi[èe]/i, "Chaufferie", "Contrat entretien chaufferie"],
+    [/contrat\s+d['']?entretien\s+(?:de\s+la\s+)?chaudi[èe]re/i, "Chaufferie", "Contrat entretien chaudière"],
+    [/contrat\s+(?:d['']?)?(?:assurance|multirisque)/i, "Assurance", "Contrat d'assurance"],
+    [/contrat\s+(?:de\s+)?(?:r[ée]partition|comptage|ista|metrona|t[ée]l[ée]rel[èe]ve)/i, "Comptage", "Contrat de comptage / répartition"],
+    [/contrat\s+de\s+syndic/i, "Syndic", "Contrat de syndic"],
+    [/contrat\s+d['']?entretien\s+(?:des?\s+)?(?:espaces\s+verts|jardin)/i, "Espaces verts", "Contrat entretien espaces verts"],
+    [/contrat\s+d['']?entretien\s+(?:de\s+la\s+)?(?:vmc|ventilation)/i, "VMC", "Contrat entretien VMC"],
+    [/contrat\s+d['']?entretien\s+(?:de\s+la\s+)?porte\s+de\s+(?:garage|parking)/i, "Porte de garage", "Contrat entretien porte de garage"],
+    [/contrat\s+(?:d['']?)?internet|fibre/i, "Internet", "Contrat internet / fibre"],
+    [/contrat\s+(?:de\s+)?(?:surveillance|alarme|t[ée]l[ée]surveillance)/i, "Surveillance", "Contrat de surveillance / télésurveillance"],
+    [/contrat\s+(?:de\s+)?maintenance\s+(?:des?\s+)?extincteur/i, "Extincteurs", "Contrat maintenance extincteurs"],
+    [/contrat\s+(?:d['']?)?entretien/i, "Entretien", "Contrat d'entretien"],
+  ];
+  for (const [re, bucket, label] of patterns) {
+    if (re.test(text)) return { bucket, label };
+  }
+  return null;
+}
+
 /** Content-based reclassification: when the text reveals the doc is actually
  *  a different type than the title-based bulk-annotate guessed, override
  *  doc_type, target_classeur, target_filename. Returns null if no override.
@@ -393,10 +425,8 @@ function reclassifyFromContent(text: string): {
   title?: string;
 } | null {
   // FICHE SYNTHÉTIQUE de la copropriété (national registry)
-  // Header always begins with "FICHE SYNTHETIQUE DE LA COPROPRIETE <num>"
   const ficheMatch = text.match(/FICHE\s+SYNTH[ÉE]TIQUE\s+DE\s+LA\s+COPROPRIETE/i);
   if (ficheMatch) {
-    // Optional generation date: "générée à partir des données mises à jour le DD/MM/YYYY"
     const genMatch = text.match(
       /(?:g[ée]n[ée]r[ée]e?|mises?\s*[àa]\s*jour)[\s\S]{0,80}?(\d{1,2}[\/.\-]\d{1,2}[\/.\-]\d{2,4})/i,
     );
@@ -413,6 +443,36 @@ function reclassifyFromContent(text: string): {
         : "Fiche synthétique copropriété (registre national)",
     };
   }
+
+  // Contract acceptance letter from the syndic. The trigger has to be tight:
+  // an AG PV may contain "le contrat de syndic a été validé" but is NOT a
+  // contract acceptance letter. Only fire if:
+  //   - the very top of the doc has the "CONTRAT ACCEPTE" banner, OR
+  //   - the syndic letterhead ("Cabinet Herbeth Immobilier") is followed by
+  //     "votre contrat ... validé/accepté" within the first ~1000 chars
+  // and the syndic acceptance phrase isn't deep in a multi-page PV.
+  const head = text.slice(0, 1500);
+  const hasAcceptanceBanner = /\bCONTRAT\s+ACCEPT[ÉE]\b/i.test(head);
+  const isAcceptanceLetter =
+    hasAcceptanceBanner ||
+    (/Cabinet\s+Herbeth\s+Immobilier/i.test(text) &&
+      /a\s+valid[ée]\s+votre\s+(?:contrat|offre)/i.test(head));
+  if (isAcceptanceLetter) {
+    const sub = detectContractSubtype(text);
+    if (sub) {
+      // Date: "le <jour> <mois> YYYY" or "le DD/MM/YYYY"
+      const dateMatch = text.match(/\ble\s+(?:lundi|mardi|mercredi|jeudi|vendredi|samedi|dimanche)?\s*(\d{1,2}\s+[a-zéèû]+\s+\d{4}|\d{1,2}[\/.\-]\d{1,2}[\/.\-]\d{2,4})/i);
+      const docDate = dateMatch ? parseFrenchDate(dateMatch[1]!) : null;
+      const fname = docDate ? `${docDate} - ${sub.label}.pdf` : `${sub.label}.pdf`;
+      return {
+        doc_type: "contract",
+        target_classeur: `Contrats/${sub.bucket}`,
+        target_filename: safeFs(fname),
+        title: docDate ? `${sub.label} (${docDate})` : sub.label,
+      };
+    }
+  }
+
   return null;
 }
 
