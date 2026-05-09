@@ -85,15 +85,21 @@ function parseFrenchDate(raw: string): string | null {
   let m = raw.match(/(\d{1,2})[\/.\-](\d{1,2})[\/.\-](\d{2,4})/);
   if (m) {
     let [, d, mo, y] = m as unknown as [string, string, string, string];
-    let yy = y.length === 2 ? `20${y}` : y;
-    if (yy.length === 5) yy = yy.slice(0, 4);
+    let yy = y.length === 2 ? `20${y}` : y.slice(0, 4);
+    const dn = Number(d), mon = Number(mo), yn = Number(yy);
+    // Sanity: day 1-31, month 1-12, year 1990-2099
+    if (dn < 1 || dn > 31 || mon < 1 || mon > 12 || yn < 1990 || yn > 2099) return null;
     return `${yy}-${mo.padStart(2, "0")}-${d.padStart(2, "0")}`;
   }
   // "15 mars 2026"
   m = raw.match(/(\d{1,2})\s+([a-zéèêû]+)\s+(\d{4})/i);
   if (m) {
     const mo = FRENCH_MONTHS_LC[m[2]!.toLowerCase()];
-    if (mo) return `${m[3]}-${String(mo).padStart(2, "0")}-${m[1]!.padStart(2, "0")}`;
+    if (mo) {
+      const dn = Number(m[1]!), yn = Number(m[3]!);
+      if (dn < 1 || dn > 31 || yn < 1990 || yn > 2099) return null;
+      return `${m[3]}-${String(mo).padStart(2, "0")}-${m[1]!.padStart(2, "0")}`;
+    }
   }
   return null;
 }
@@ -107,57 +113,125 @@ interface Extracted {
   extraMerge?: Record<string, unknown>;
 }
 
+/** Detect the actual recipient (SDC) of a document. We expect "VILLENEUVE"
+ *  somewhere; if a different copro name appears, flag it as misfiled. */
+function detectRecipient(text: string): { recipient: string | null; misfiled_warning: string | null } {
+  // Single all-caps word (the SDC name itself), optionally preceded by "LES"
+  // or "RESIDENCE". We avoid greedy multi-word capture that swallows the
+  // following address.
+  const patterns = [
+    /SDC\s+(?:RESIDENCE\s+)?(LES\s+)?([A-ZÉÈÀ][A-ZÉÈÀ'-]{2,30})/,
+    /COPROPRIETE\s+(?:RESIDENCE\s+)?(LES\s+)?([A-ZÉÈÀ][A-ZÉÈÀ'-]{2,30})/i,
+    /R[ÉE]SIDENCE\s+(LES\s+)?([A-ZÉÈÀ][A-ZÉÈÀ'-]{2,30})/,
+  ];
+  let recipient: string | null = null;
+  for (const re of patterns) {
+    const m = text.match(re);
+    if (m && m[2]) {
+      recipient = ((m[1] ?? "") + m[2]).trim().replace(/\s+/g, " ");
+      break;
+    }
+  }
+  // Heuristic: the user's copropriété is "VILLENEUVE", at "9 rue Lavéran" /
+  // "126-128 av. Strasbourg" / "57000 METZ".
+  const looksVilleneuve =
+    /VILLENEUVE|LAV[ÉE]RAN|LAVERAN|126[-\s]*128.{0,10}STRASBOURG/i.test(text);
+  let warning: string | null = null;
+  if (recipient && !/VILLENEUVE/i.test(recipient) && !looksVilleneuve) {
+    warning = `Document semble destiné à « ${recipient} », pas à VILLENEUVE — vérifier s'il s'agit d'un fichier mal classé.`;
+  }
+  return { recipient, misfiled_warning: warning };
+}
+
 function extractInvoice(text: string): Extracted {
   const fields: Partial<MetadataInput> = {};
   const extra: Record<string, unknown> = {};
 
-  // Invoice number — look for "Facture N° X" / "FACTURE n°X" / "N° X" near "FACTURE"
+  // Invoice number — try several patterns. Many suppliers use varied formats:
+  //   "Facture N° 220746"            (inline)
+  //   "FACTURE  5701F-26-001147"     (inline)
+  //   "FC_0000861525"                (Athome)
+  //   column header "N° Facture" with value on next data row
   const refPatterns = [
-    /(?:facture|fact\.?)\s*n[°ºo]?\s*[:.]?\s*([A-Z0-9][A-Z0-9_/.-]{2,})/i,
-    /^FACTURE\s+([A-Z0-9][A-Z0-9_/.-]{2,})\s*$/im,
-    /^F\s*N[°º]\s*([A-Z0-9][A-Z0-9_/.-]{2,})/im,
+    // "Facture N° X" inline — same line, X must contain at least one digit
+    /(?:facture|fact\.?)\s+n[°ºo]\s*[:.]?\s*([A-Z0-9][A-Z0-9_/.-]*\d[A-Z0-9_/.-]*)/i,
+    // "FACTURE  XYZ" or "FACTURE _XYZ" inline (handles ILEX's leading underscore)
+    /\bFACTURE\b\s+_?([A-Z0-9][A-Z0-9_/.-]*\d[A-Z0-9_/.-]*)/,
+    // Column-style: "N° Facture" header then a French-style ref like 24-04-51042
+    /N[°ºo]\s*Facture[\s\S]{0,400}?\b(\d{2,}[-/.]\d{2,}[-/.][\dA-Z]{2,})\b/i,
+    // Format like "FC_0000861525" appearing anywhere (Athome)
+    /\bFC[_-]?(\d{7,})\b/i,
   ];
   for (const re of refPatterns) {
     const m = text.match(re);
     if (m && m[1]) {
-      fields.reference = m[1].replace(/[.,;]+$/, "").trim();
-      break;
-    }
-  }
-
-  // Document date — first DD/MM/YYYY near "Date" word, else first plausible date
-  const dateNearLabel = text.match(/date[\s:]*(\d{1,2}[\/.\-]\d{1,2}[\/.\-]\d{2,4})/i);
-  const docDate = dateNearLabel ? parseFrenchDate(dateNearLabel[1]!) : null;
-  if (docDate) fields.document_date = docDate;
-
-  // Total TTC
-  const ttcPatterns = [
-    /(?:total\s*t\.?\s*t\.?\s*c\.?|net\s*à\s*payer|montant\s*ttc)[\s\S]{0,80}?(\d[\d\s.,  ]{0,20}\d)\s*€?/i,
-    /€\s*ttc[\s\S]{0,80}?(\d[\d\s.,  ]{0,20}\d)/i,
-  ];
-  for (const re of ttcPatterns) {
-    const m = text.match(re);
-    if (m) {
-      const cents = parseFrenchAmount(m[1]!);
-      if (cents !== null && cents > 0) {
-        fields.amount_cents = cents;
+      const ref = m[1].replace(/[.,;]+$/, "").trim();
+      // Sanity: must contain at least one digit and not be a French word
+      if (/\d/.test(ref) && !/^(?:facture|page|date|client|copro)/i.test(ref)) {
+        fields.reference = ref;
         break;
       }
     }
   }
 
+  // Document date — most reliable signal is "Date" header followed by DD/MM/YYYY,
+  // or a date sitting next to the invoice number in a column-style row.
+  const datePatterns = [
+    // "Date: DD/MM/YYYY" or "Date DD/MM/YYYY" inline
+    /\bdate\b[\s:]+(\d{1,2}[\/.\-]\d{1,2}[\/.\-]\d{2,4})/i,
+    // After a "Date" column header, scan up to 250 chars for first date
+    /N[°ºo]\s*Facture[\s\S]{0,400}?(\d{1,2}[\/.\-]\d{1,2}[\/.\-]\d{2,4})/i,
+    // "le DD/MM/YYYY"
+    /\ble\s+(\d{1,2}[\/.\-]\d{1,2}[\/.\-]\d{2,4})/i,
+  ];
+  for (const re of datePatterns) {
+    const m = text.match(re);
+    const parsed = m ? parseFrenchDate(m[1]!) : null;
+    if (parsed) {
+      fields.document_date = parsed;
+      break;
+    }
+  }
+
+  // Strict French monetary format: digits, optional thousand-spaces,
+  // decimal comma or dot, 2 digits. Captures e.g. "1 560,00", "10 156,97", "67,06".
+  const FR_AMOUNT_SRC = String.raw`(\d{1,3}(?:[  ]\d{3})*[,.]\d{2})`;
+
+  // Total TTC. Take the LAST match in the doc (column-style invoices repeat
+  // HT/TVA/TTC headers; the final occurrence is the bottom-line total).
+  const ttcRe = new RegExp(
+    `(?:total\\s*[€\\s]*t\\.?\\s*t\\.?\\s*c\\.?|net\\s*à\\s*payer|montant\\s*ttc|à\\s*payer\\s*€?)[\\s\\S]{0,200}?${FR_AMOUNT_SRC}\\s*€?`,
+    "gi",
+  );
+  let lastTtc: string | null = null;
+  for (const m of text.matchAll(ttcRe)) lastTtc = m[1] ?? null;
+  if (lastTtc) {
+    const cents = parseFrenchAmount(lastTtc);
+    if (cents !== null && cents > 0 && cents < 100_000_000) fields.amount_cents = cents;
+  }
+
   // Total HT
-  const htMatch = text.match(/total\s*h\.?\s*t\.?[\s\S]{0,80}?(\d[\d\s.,  ]{0,20}\d)\s*€?/i);
-  if (htMatch) {
-    const cents = parseFrenchAmount(htMatch[1]!);
-    if (cents !== null && cents > 0) fields.amount_ht_cents = cents;
+  const htRe = new RegExp(
+    `total\\s*[€\\s]*h\\.?\\s*t\\.?[\\s\\S]{0,200}?${FR_AMOUNT_SRC}\\s*€?`,
+    "gi",
+  );
+  let lastHt: string | null = null;
+  for (const m of text.matchAll(htRe)) lastHt = m[1] ?? null;
+  if (lastHt) {
+    const cents = parseFrenchAmount(lastHt);
+    if (cents !== null && cents > 0 && cents < 100_000_000) fields.amount_ht_cents = cents;
   }
 
   // VAT
-  const vatMatch = text.match(/total\s*t\.?\s*v\.?\s*a\.?[\s\S]{0,80}?(\d[\d\s.,  ]{0,20}\d)\s*€?/i);
-  if (vatMatch) {
-    const cents = parseFrenchAmount(vatMatch[1]!);
-    if (cents !== null && cents >= 0) fields.vat_cents = cents;
+  const vatRe = new RegExp(
+    `total\\s*[€\\s]*(?:t\\.?\\s*v\\.?\\s*a\\.?|tva)[\\s\\S]{0,200}?${FR_AMOUNT_SRC}\\s*€?`,
+    "gi",
+  );
+  let lastVat: string | null = null;
+  for (const m of text.matchAll(vatRe)) lastVat = m[1] ?? null;
+  if (lastVat) {
+    const cents = parseFrenchAmount(lastVat);
+    if (cents !== null && cents >= 0 && cents < 100_000_000) fields.vat_cents = cents;
   }
 
   // Currency hint: € everywhere → EUR
@@ -188,6 +262,13 @@ function extractInvoice(text: string): Extracted {
   // IBAN
   const iban = text.match(/IBAN\s*[:]*\s*([A-Z]{2}\d{2}\s?[\d\s]{18,30})/);
   if (iban) extra.iban = iban[1]!.replace(/\s/g, "");
+
+  // Recipient detection — flag misfiled docs (Villeneuve extranet but recipient elsewhere)
+  const recipientCheck = detectRecipient(text);
+  if (recipientCheck.recipient) extra.recipient = recipientCheck.recipient;
+  if (recipientCheck.misfiled_warning) {
+    extra.misfiled_warning = recipientCheck.misfiled_warning;
+  }
 
   return { fields, extraMerge: Object.keys(extra).length ? extra : undefined };
 }
@@ -230,10 +311,10 @@ function extractBankStatement(text: string): Extracted {
   if (account) extra.account_name = account[0]!.trim();
 
   // Solde initial / final
-  const soldeFinal = text.match(/solde\s+(?:d[eé]biteur|cr[ée]diteur)\s+au\s+\d{1,2}[\/.\-]\d{1,2}[\/.\-]\d{2,4}\*?[\s\S]{0,30}?(-?[\d\s.,  ]+)\s*€?/gi);
+  const soldeFinal = text.match(/solde\s+(?:d[eé]biteur|cr[ée]diteur)\s+au\s+\d{1,2}[\/.\-]\d{1,2}[\/.\-]\d{2,4}\*?[\s\S]{0,30}?(-?[\d\s.,]+)\s*€?/gi);
   if (soldeFinal && soldeFinal.length > 0) {
     const last = soldeFinal[soldeFinal.length - 1]!;
-    const valMatch = last.match(/(-?[\d\s.,  ]+)\s*€?$/);
+    const valMatch = last.match(/(-?[\d\s.,]+)\s*€?$/);
     if (valMatch) {
       const cents = parseFrenchAmount(valMatch[1]!);
       if (cents !== null) extra.solde_final_cents = cents;
@@ -265,7 +346,7 @@ function extractMeetingMinutes(text: string): Extracted {
   if (resMatch) extra.resolutions_count = Number(resMatch[1]!);
 
   // Tantiemes total
-  const tantMatch = text.match(/tanti[èe]mes?\s+(?:total|g[ée]n[ée]ral)\s*[:.]?\s*(\d[\d\s.,  ]+)/i);
+  const tantMatch = text.match(/tanti[èe]mes?\s+(?:total|g[ée]n[ée]ral)\s*[:.]?\s*(\d[\d\s.,]+)/i);
   if (tantMatch) extra.tantiemes = tantMatch[1]!.replace(/\s/g, "");
 
   return { fields, extraMerge: Object.keys(extra).length ? extra : undefined };
@@ -357,7 +438,20 @@ for (const row of rows) {
 
   const text = readFileSync(row.ocr_text_path, "utf8");
   const result = extractor(text);
-  const input: MetadataInput = { document_id: row.document_id, ...result.fields };
+  // Always overwrite the extractor-managed fields — null when not extracted —
+  // so re-runs after fixing a regex actually clear stale values. Fields not in
+  // EXTRACTOR_MANAGED are left untouched (preserving manual curations).
+  // Supplier is intentionally NOT in this list — it's set by the title-based
+  // bulk-annotate via the suppliers table; only manual curation overrides it.
+  const EXTRACTOR_MANAGED = [
+    "reference", "document_date", "amount_cents", "amount_ht_cents",
+    "vat_cents", "currency", "period_start", "period_end",
+  ] as const;
+  const fields = result.fields as Record<string, unknown>;
+  const input: MetadataInput = { document_id: row.document_id };
+  for (const k of EXTRACTOR_MANAGED) {
+    (input as unknown as Record<string, unknown>)[k] = fields[k] ?? null;
+  }
   if (result.extraMerge) {
     input.extra = { ...parsedExtra, ...result.extraMerge };
   }
