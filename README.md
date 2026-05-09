@@ -9,6 +9,22 @@ See [`CLAUDE.md`](./CLAUDE.md) for the **document classification reference**
 (target tree, doc_type signals, filename convention, canonical suppliers,
 known quirks).
 
+## Two layers
+
+This project has **two clearly separated layers**:
+
+1. **MCP server** (`src/`) — the public API consumed by Claude Code, Claude
+   Desktop, or any MCP client. Exposes tools to query the extranet, manage
+   curated metadata, full-text search the catalog, import/export the DB, and
+   download files. **This is what gets packaged in the Docker image and
+   deployed.** End users never see anything else.
+2. **Operator pipeline** (`scripts/`) — Bun scripts that build the curated
+   metadata DB from scratch: download every PDF, OCR it, classify it, split
+   bundles, merge pairs, materialize the parallel filesystem. **Runs once
+   locally during setup.** Not in the Docker image, not callable via MCP.
+   You ship the resulting `data/metadata.db` (and optionally `data/sources/`)
+   to your deployment.
+
 ## Quick start
 
 ```bash
@@ -198,7 +214,13 @@ suppliers (capped at 50), breakdown by `target_classeur`.
 
 ---
 
-## CLI scripts
+## Operator pipeline (scripts)
+
+> **Operator-only tooling.** These scripts are NOT shipped in the Docker
+> image and are NOT callable via MCP. They're used once locally to build
+> `data/metadata.db` (+ `data/sources/` and `data/output/`); after that,
+> only the MCP server runs. Re-run when you need to ingest new extranet
+> uploads or refine classifications.
 
 All under `scripts/`. Idempotent, runnable independently. The pipeline
 order to go from "raw extranet" → "curated parallel filesystem" is:
@@ -346,9 +368,10 @@ data/
 
 ## Docker
 
-The runtime image bundles `ocrmypdf`, `tesseract` (fra+eng), `poppler-utils`,
-`qpdf`, `ghostscript`, `unpaper`, so the full pipeline (including OCR) runs
-inside the container.
+The runtime image is **intentionally minimal** — just Bun + the MCP
+server. OCR / PDF tooling lives outside the image (operator pipeline
+runs locally). `scripts/`, `data/`, `CLAUDE.md`, etc. are excluded via
+`.dockerignore`.
 
 ```bash
 docker build -t herbeth-mcp .
@@ -358,8 +381,30 @@ docker run --rm -p 3000:3000 \
   herbeth-mcp
 ```
 
-`/app/data` is declared as a volume (curated metadata + sources persist
-across deploys).
+`/app/data` is declared as a volume — copy your prepared
+`metadata.db` (and optionally `sources/`) there before starting.
+
+### Operator workflow vs. deploy
+
+```
+                        operator (local laptop)                              deploy (container)
+─────────────────────────────────────────────────────────                    ──────────────────
+1. Run scripts/* pipeline                                                    
+   → produces data/metadata.db, data/sources/*, data/output/*                
+2. Optionally back up: bun scripts/export-db.ts backup.db                    
+3. Push the resulting data/ to your deploy host (or S3, etc.)  ─────────►    /app/data/* (volume)
+                                                                             │
+                                                                             ▼
+                                                                             docker run … herbeth-mcp
+                                                                             │
+                                                                             ▼
+                                                                             MCP clients
+                                                                             (Claude Code, …)
+                                                                             over HTTP Basic auth
+```
+
+To re-ingest new extranet uploads, run the pipeline locally again,
+re-export, replace the volume.
 
 ## Development
 

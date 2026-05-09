@@ -9,8 +9,12 @@ node_modules
 .vscode
 .idea
 README.md
+CLAUDE.md
 Dockerfile
 .dockerignore
+.claude
+# Operator-only pipeline. Not part of the deployed MCP server.
+scripts
 data
 *.db
 *.db-journal

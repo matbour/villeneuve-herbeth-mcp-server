@@ -7,20 +7,12 @@ RUN bun install --frozen-lockfile --production
 FROM oven/bun:1.3-alpine AS runtime
 WORKDIR /app
 
-# OCR + PDF tooling for the bulk-annotate / OCR pipeline:
-#   - ocrmypdf wraps tesseract to produce searchable PDFs from scans
-#   - tesseract-ocr-data-fra adds the French language model
-#   - poppler-utils provides pdftotext / pdfinfo / pdftoppm
-#   - qpdf is used to split multi-document PDFs page-range by page-range
-#   - ghostscript is required by ocrmypdf for PDF/A output
-RUN apk add --no-cache \
-    ocrmypdf \
-    tesseract-ocr-data-fra \
-    tesseract-ocr-data-eng \
-    poppler-utils \
-    qpdf \
-    ghostscript \
-    unpaper
+# Runtime image is intentionally minimal: just Bun + the MCP server.
+# OCR / PDF tools (ocrmypdf, tesseract, poppler-utils, qpdf, ghostscript,
+# unpaper) are only needed by the operator pipeline under scripts/, which
+# runs outside the deployed container. If you ever want to run the
+# pipeline inside Docker, install them in a dedicated build stage or use
+# `oven/bun:1.3-debian` and `apt-get install ocrmypdf qpdf …`.
 ENV NODE_ENV=production \
     MCP_TRANSPORT=http \
     HOST=0.0.0.0 \
