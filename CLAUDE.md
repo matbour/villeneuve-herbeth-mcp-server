@@ -5,6 +5,13 @@ copropriété documents pulled from the Cabinet Herbeth Immobilier extranet.
 Use it both when manually curating individual rows (via the MCP
 `set_document_metadata` tool) and when refining the bulk pipeline scripts.
 
+> **Keep `README.md` in sync.** When you add, remove, or rename an MCP tool
+> in `src/server.ts`, or add a new CLI script under `scripts/`, update
+> the corresponding section in `README.md` so the public tool catalog
+> stays accurate. The classification rules below (target tree, doc_type
+> signals, filename convention, suppliers) live here in `CLAUDE.md`;
+> the **tool list** lives in `README.md`. Don't duplicate either.
+
 The user's copropriété is **VILLENEUVE**, located at
 **126-128 Avenue de Strasbourg + 9 rue Lavéran à METZ (57000)**, registered as
 **SDC VILLENEUVE** (immatriculation `AD7-401-599`), syndic
